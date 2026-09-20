@@ -1,0 +1,12 @@
+{
+  "generator": "Native Metal template",
+  "tool": "tools/generate_squared_error.py",
+  "target": "metal",
+  "rows": 131071,
+  "threads": 256,
+  "sha256": "c7796f0b689a7b37514311f948cd01f7a092e711b56de18cb4092218c1df6edf",
+  "gpu_validated": true,
+  "role": "Standalone squared-error kernel; the training runtime uses kernels/boost.metal.",
+  "max_absolute_error": 0.0,
+  "padding_untouched": true
+}

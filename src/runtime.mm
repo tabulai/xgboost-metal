@@ -1,0 +1,198 @@
+#include "metalgb/runtime.hpp"
+#include "metal_library.hpp"
+#include <nlohmann/json.hpp>
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+
+namespace metalgb {
+namespace {
+std::string error_text(NSError* error) {
+  return error ? std::string([[error localizedDescription] UTF8String]) : "unknown Metal error";
+}
+}
+struct Runtime::Impl {
+  id<MTLDevice> device;
+  id<MTLCommandQueue> queue;
+  id<MTLLibrary> library;
+  std::map<std::string, id<MTLComputePipelineState>, std::less<>> pipelines;
+  std::mutex mutex;
+  ~Impl() {
+    for (auto const& [name, pipeline] : pipelines) [pipeline release];
+    [library release]; [queue release]; [device release];
+  }
+};
+Runtime& Runtime::get() { static Runtime runtime; return runtime; }
+Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
+  @autoreleasepool {
+    impl_->device = MTLCreateSystemDefaultDevice();
+    if (!impl_->device || ![impl_->device hasUnifiedMemory] ||
+        ![impl_->device supportsFamily:MTLGPUFamilyApple7])
+      throw std::runtime_error("xgboost-metal requires an Apple silicon Metal GPU; no CPU fallback exists.");
+    impl_->queue = [impl_->device newCommandQueue];
+    if (!impl_->queue) throw std::runtime_error("Cannot create the Metal command queue.");
+    dispatch_data_t source = dispatch_data_create(kMetalLibrary, kMetalLibrarySize, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    NSError* error = nil;
+    impl_->library = [impl_->device newLibraryWithData:source error:&error];
+    dispatch_release(source);
+    if (!impl_->library) throw std::runtime_error("Cannot load embedded Metal kernels: " + error_text(error));
+  }
+}
+Runtime::~Runtime() = default;
+void* Runtime::device() const { return (void*)impl_->device; }
+void* Runtime::queue() const { return (void*)impl_->queue; }
+void* Runtime::pipeline(std::string_view name) {
+  std::lock_guard lock(impl_->mutex);
+  if (auto it = impl_->pipelines.find(name); it != impl_->pipelines.end()) return (void*)it->second;
+  @autoreleasepool {
+    NSString* symbol = [NSString stringWithUTF8String:std::string(name).c_str()];
+    id<MTLFunction> function = [impl_->library newFunctionWithName:symbol];
+    if (!function) throw std::runtime_error("Missing Metal kernel: " + std::string(name));
+    NSError* error = nil;
+    auto pipeline = [impl_->device newComputePipelineStateWithFunction:function error:&error];
+    [function release];
+    if (!pipeline) throw std::runtime_error("Metal pipeline " + std::string(name) + ": " + error_text(error));
+    impl_->pipelines.emplace(std::string(name), pipeline);
+    return (void*)pipeline;
+  }
+}
+std::string Runtime::info() const {
+  @autoreleasepool {
+    nlohmann::json info{{"USE_METAL", true}, {"USE_CUDA", false}, {"USE_OPENMP", false},
+      {"USE_NCCL", false}, {"USE_DLOPEN_NCCL", false}, {"USE_RMM", false},
+      {"DEBUG", false}, {"BUILTIN_PREFETCH_PRESENT", false},
+      {"METAL_DEVICE", [[impl_->device name] UTF8String]},
+      {"METAL_UNIFIED_MEMORY", static_cast<bool>([impl_->device hasUnifiedMemory])},
+      {"METAL_MAX_BUFFER_LENGTH", [impl_->device maxBufferLength]},
+      {"METAL_MAX_THREADGROUP_MEMORY", [impl_->device maxThreadgroupMemoryLength]},
+      {"METAL_RECOMMENDED_WORKING_SET", [impl_->device recommendedMaxWorkingSetSize]},
+      {"BACKEND", "metal"}, {"XGBOOST_REFERENCE", "6d2dbe19a099aa046178be8cfc303bfec1a623a6"}};
+    return info.dump();
+  }
+}
+Buffer::Buffer(std::size_t bytes) : bytes_(bytes) {
+  @autoreleasepool {
+    id<MTLDevice> device = (id<MTLDevice>)Runtime::get().device();
+    if (bytes > [device maxBufferLength]) throw std::runtime_error("Requested buffer exceeds Metal maxBufferLength.");
+    // Even an unused array must fit its element type for Metal argument validation.
+    id<MTLBuffer> buffer = [device newBufferWithLength:std::max<std::size_t>(bytes, 64)
+                                           options:MTLResourceStorageModeShared];
+    if (!buffer) throw std::bad_alloc();
+    object_ = std::shared_ptr<void>((void*)buffer, [](void* p) { [(id<MTLBuffer>)p release]; });
+  }
+}
+Buffer::Buffer(void const* data, std::size_t bytes) : Buffer(bytes) {
+  if (bytes) std::memcpy(this->data(), data, bytes);
+}
+void* Buffer::data() const { return object_ ? [(id<MTLBuffer>)object_.get() contents] : nullptr; }
+Buffer Buffer::prefix(std::size_t bytes) const {
+  if (bytes > bytes_) throw std::invalid_argument("Buffer prefix exceeds its allocation.");
+  Buffer result = *this;
+  result.bytes_ = bytes;
+  return result;
+}
+Command::Command(std::string_view label, bool coalesce, bool compute_fill)
+    : coalesce_(coalesce), compute_fill_(compute_fill) {
+  @autoreleasepool {
+    id<MTLCommandBuffer> command = [(id<MTLCommandQueue>)Runtime::get().queue() commandBuffer];
+    if (!command) throw std::runtime_error("Cannot allocate Metal command buffer.");
+    [command retain];
+    command.label = [NSString stringWithUTF8String:std::string(label).c_str()];
+    object_ = (void*)command;
+  }
+}
+Command::~Command() { end_compute(); [(id<MTLCommandBuffer>)object_ release]; }
+void* Command::begin_compute() {
+  if (!encoder_) {
+    // Serial encoders make each dispatch's writes visible to the next one,
+    // including GPU-produced indirect arguments. No concurrent dispatches are
+    // used here: the histogram and partition kernels depend on their inputs.
+    auto encoder = [(id<MTLCommandBuffer>)object_ computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    if (!encoder) throw std::runtime_error("Cannot allocate Metal compute encoder.");
+    [encoder retain];
+    encoder_ = (void*)encoder;
+    ++encoder_count_;
+  }
+  return encoder_;
+}
+void Command::end_compute() {
+  if (encoder_) {
+    [(id<MTLComputeCommandEncoder>)encoder_ endEncoding];
+    [(id<MTLComputeCommandEncoder>)encoder_ release];
+    encoder_ = nullptr;
+  }
+}
+void Command::dispatch(std::string_view kernel, std::initializer_list<Buffer> buffers,
+                       void const* params, std::size_t size, Extent groups, Extent threads,
+                       std::size_t threadgroup_bytes) {
+  if (submitted_) throw std::logic_error("Cannot encode a committed Metal command buffer.");
+  if (!groups.x || !groups.y || !groups.z) return;
+  @autoreleasepool {
+    auto pipeline = (id<MTLComputePipelineState>)Runtime::get().pipeline(kernel);
+    if (threads.x * threads.y * threads.z > pipeline.maxTotalThreadsPerThreadgroup)
+      throw std::runtime_error("Threadgroup exceeds the Metal pipeline limit.");
+    if (threadgroup_bytes) {
+      auto device = (id<MTLDevice>)Runtime::get().device();
+      if (threadgroup_bytes + pipeline.staticThreadgroupMemoryLength > device.maxThreadgroupMemoryLength)
+        throw std::runtime_error("Threadgroup memory exceeds the Metal device limit.");
+    }
+    auto encoder = (id<MTLComputeCommandEncoder>)begin_compute();
+    [encoder setComputePipelineState:pipeline];
+    unsigned index = 0;
+    for (auto const& buffer : buffers) [encoder setBuffer:(id<MTLBuffer>)buffer.native() offset:0 atIndex:index++];
+    if (size) [encoder setBytes:params length:size atIndex:index];
+    if (threadgroup_bytes) [encoder setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(groups.x, groups.y, groups.z)
+           threadsPerThreadgroup:MTLSizeMake(threads.x, threads.y, threads.z)];
+    if (!coalesce_) end_compute();
+  }
+}
+void Command::dispatch_indirect(std::string_view kernel, std::initializer_list<Buffer> buffers,
+                                void const* params, std::size_t size, Buffer const& arguments, Extent threads) {
+  if (submitted_) throw std::logic_error("Cannot encode a committed Metal command buffer.");
+  if (arguments.size() < sizeof(MTLDispatchThreadgroupsIndirectArguments))
+    throw std::invalid_argument("Indirect dispatch requires three uint32 arguments.");
+  @autoreleasepool {
+    auto pipeline = (id<MTLComputePipelineState>)Runtime::get().pipeline(kernel);
+    if (threads.x * threads.y * threads.z > pipeline.maxTotalThreadsPerThreadgroup)
+      throw std::runtime_error("Threadgroup exceeds the Metal pipeline limit.");
+    auto encoder = (id<MTLComputeCommandEncoder>)begin_compute();
+    [encoder setComputePipelineState:pipeline];
+    unsigned index = 0;
+    for (auto const& buffer : buffers) [encoder setBuffer:(id<MTLBuffer>)buffer.native() offset:0 atIndex:index++];
+    if (size) [encoder setBytes:params length:size atIndex:index];
+    [encoder dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)arguments.native() indirectBufferOffset:0
+                              threadsPerThreadgroup:MTLSizeMake(threads.x, threads.y, threads.z)];
+    if (!coalesce_) end_compute();
+  }
+}
+void Command::zero(Buffer const& buffer) {
+  if (submitted_) throw std::logic_error("Cannot encode a committed Metal command buffer.");
+  if (!buffer.size()) return;
+  if (compute_fill_) {
+    auto bytes = buffer.size();
+    dispatch("fill_zero", {buffer}, bytes, {std::min<std::size_t>(div_up(bytes, 16 * 256), 65535), 1, 1});
+    return;
+  }
+  @autoreleasepool {
+    end_compute();
+    auto encoder = [(id<MTLCommandBuffer>)object_ blitCommandEncoder];
+    if (!encoder) throw std::runtime_error("Cannot allocate Metal blit encoder.");
+    ++encoder_count_;
+    [encoder fillBuffer:(id<MTLBuffer>)buffer.native() range:NSMakeRange(0, buffer.size()) value:0];
+    [encoder endEncoding];
+  }
+}
+double Command::wait() {
+  @autoreleasepool {
+    auto command = (id<MTLCommandBuffer>)object_;
+    if (!submitted_) { end_compute(); [command commit]; submitted_ = true; }
+    [command waitUntilCompleted];
+    if (command.status == MTLCommandBufferStatusError)
+      throw std::runtime_error("Metal execution failed: " + error_text(command.error));
+    return command.GPUEndTime - command.GPUStartTime;
+  }
+}
+}  // namespace metalgb

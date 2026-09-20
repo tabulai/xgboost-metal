@@ -1,0 +1,59 @@
+{
+  "reference_commit": "6d2dbe19a099aa046178be8cfc303bfec1a623a6",
+  "reference_version": "3.5.0-dev",
+  "reference_library_sha256": "061d0e5e88a7e7282d2eab9d0b4c53a12f73f2c83a999785b20c61e82c30bfc7",
+  "generator_sha256": "655a22da4cf264c5ac23e8bbe8beed6cb25e710a325a22c52bc6b37cb3582136",
+  "cases": {
+    "uint16-1": {
+      "dtype": "uint16",
+      "outputs": 1,
+      "params": {
+        "max_depth": 3,
+        "max_bin": 8,
+        "base_score": 0,
+        "max_cat_to_onehot": 1,
+        "multi_strategy": "one_output_per_tree"
+      }
+    },
+    "uint16-3": {
+      "dtype": "uint16",
+      "outputs": 3,
+      "params": {
+        "max_depth": 3,
+        "max_bin": 8,
+        "base_score": 0,
+        "max_cat_to_onehot": 1,
+        "multi_strategy": "multi_output_tree"
+      }
+    },
+    "uint32-1": {
+      "dtype": "uint32",
+      "outputs": 1,
+      "params": {
+        "max_depth": 3,
+        "max_bin": 8,
+        "base_score": 0,
+        "max_cat_to_onehot": 1,
+        "multi_strategy": "one_output_per_tree"
+      }
+    },
+    "uint32-3": {
+      "dtype": "uint32",
+      "outputs": 3,
+      "params": {
+        "max_depth": 3,
+        "max_bin": 8,
+        "base_score": 0,
+        "max_cat_to_onehot": 1,
+        "multi_strategy": "multi_output_tree"
+      }
+    }
+  },
+  "files": {
+    "expected.npz": "e0c6669ac19fa75fbe2d66f59f22cc677479f5f6924631f010d6d6bec80c8221",
+    "uint16-1.ubj": "5624f06bb3d71b8d94527351f8b6576c6bb63fffa4a6e1eb823f8b995d2be7e5",
+    "uint16-3.ubj": "f7f95bce9823cf05d5e71dbd9718dc8591766c431552a84fa0e3ba1d27aec2f4",
+    "uint32-1.ubj": "a8661fa61541ee7fc1c11d544fdcab1dd048d3ef1ed7fbfcf81ffe4ae0931b9a",
+    "uint32-3.ubj": "364cb0be0f2f6e613f93ade42efdd56730714ec24e33f5677f379ce5ae7dcee8"
+  }
+}

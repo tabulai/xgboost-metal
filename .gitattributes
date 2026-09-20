@@ -1,0 +1,2 @@
+# Preserve verbatim upstream license formatting.
+third_party/**/LICENSE* -whitespace
