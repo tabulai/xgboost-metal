@@ -108,3 +108,34 @@ def test_error_counts_fractional_labels(metric, threshold):
     expected = np.sum(weight * np.where(prediction > threshold, 1 - label, label), dtype=np.float64)
     actual = float(model.eval(d).split(":")[1])
     assert actual == pytest.approx(expected / np.sum(weight, dtype=np.float64), rel=5e-6)
+
+
+@pytest.mark.parametrize("margin,label,weight", [
+    ([1, 0], [0, 1], [1e-37, 1]),
+    ([1, 0], [0, 1], [1, 1e37]),
+    ([1, 0], [0, 1], [1e-20, 1e20]),
+    ([2, 1, 1], [0, 1, 0], [1e-5, 2e38, 2e38]),
+    ([2, 1, 1], [1, 1, 0], [1e-5, 1e5, 1e10]),
+    ([1, 0], [0, 1], [1e4, 1]),
+    ([1, 0], [0, 1], [4, 1]),
+    ([1, 0], [0, 1], [3.999, 1]),
+    ([1, 0], [0, 1], [3.2134451, 1]),
+], ids=["tiny-leading-weight", "large-trailing-weight", "ratio-overflow",
+        "step-sum-overflow", "tied-low-precision", "small-increment",
+        "series-boundary", "above-series-boundary", "moderate-increment"])
+def test_aucpr_extreme_weight_ratios(margin, label, weight):
+    # Finite class totals can still overflow an unbounded step/cumulative
+    # ratio or its logarithm's intermediates. Zero rounds isolate evaluation
+    # from training; tied predictions also exercise a mixed-class PR segment.
+    margin, label, weight = [np.asarray(value, dtype=np.float32)
+                             for value in (margin, label, weight)]
+    data = xgb.DMatrix(np.arange(len(label), dtype=np.float32)[:, None],
+                       label=label, weight=weight, base_margin=margin)
+    model = xgb.train({"objective": "reg:squarederror", "eval_metric": "aucpr",
+                       "base_score": 0.5}, data, num_boost_round=0)
+    prediction = model.predict(data)
+    np.testing.assert_array_equal(prediction, margin)
+    actual = float(model.eval(data).split(":")[1])
+    expected = reference_binary_auc(prediction, label, weight, pr=True)
+    assert math.isfinite(actual) and 0 <= actual <= 1
+    assert actual == pytest.approx(expected, rel=5e-6, abs=1e-12)

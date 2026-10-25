@@ -1623,12 +1623,46 @@ inline void auc_accumulate(thread float2& high, thread float2& low, float2 value
   high = sum + error;
   low = error - (high - sum);
 }
-// u - log(1 + u). With z = u / (2 + u), log1p(u) = 2 atanh(z), so for small u
-// this is 2z^2 (1 + 2z/3 + z^2 + 4z^3/5 + ...) with no cancellation.
-inline float log1p_excess(float u) {
-  if (u > 0.25f) return u - log1p_stable(u);
-  float z = u / (2 + u);
-  return 2 * z * z * (1 + z * (2.0f / 3 + z * (1 + z * (0.8f + z * (1 + z * (6.0f / 7 + z * (1 + z * (8.0f / 9))))))));
+inline float auc_pr_segment(float2 previous, float2 step, float positives) {
+  // The mean precision over this segment is r*L + q*(1-L), where r is
+  // previous precision, q is this tie group's precision, and
+  // L = log1p(u)/u for u = step mass / previous mass. All weights are
+  // nonnegative, avoiding cancellation between the reference formula's terms.
+  float step_scale = max(step.x, step.y);
+  float2 normalized_step = step / step_scale;
+  float q = normalized_step.x / (normalized_step.x + normalized_step.y);
+  float rise = step.x / positives;
+  float previous_scale = max(previous.x, previous.y);
+  if (previous_scale == 0) return rise * q;
+  float2 normalized_previous = previous / previous_scale;
+  float r = normalized_previous.x / (normalized_previous.x + normalized_previous.y);
+
+  // Scale before summing: each class total may be finite even when their
+  // sum overflows. Separate scales above preserve each precision ratio.
+  float scale = max(previous_scale, step_scale);
+  float2 before = previous / scale, increment = step / scale;
+  float cumulative = before.x + before.y, mass = increment.x + increment.y;
+  float retained, added;
+  if (mass <= 0.25f * cumulative) {
+    float u = mass / cumulative, z = u / (2 + u);
+    // (u - log1p(u))/u, using log1p(u) = 2*atanh(z). Computing this
+    // normalized series directly avoids cancellation and squaring tiny u.
+    added = z * (1 - z) * (1 + z * (2.0f / 3 + z * (1 + z * (0.8f + z * (1 + z * (6.0f / 7 + z * (1 + z * (8.0f / 9))))))));
+    retained = 1 - added;
+  } else if (mass <= cumulative) {
+    // Here u is bounded by one; evaluate its logarithm directly to avoid
+    // subtracting nearly equal logarithms in the reciprocal expression.
+    float u = mass / cumulative;
+    retained = log1p_stable(u) / u;
+    added = 1 - retained;
+  } else {
+    // Use the reciprocal ratio, bounded by one, so neither u nor the
+    // logarithm's intermediates can overflow. v==0 is the limiting value.
+    float v = cumulative / mass;
+    retained = v == 0 ? 0 : v * (log1p_stable(v) - log(v));
+    added = 1 - retained;
+  }
+  return rise * (r * retained + q * added);
 }
 kernel void auc_reduce(device const float4* sorted [[buffer(0)]],
                        device float4* output [[buffer(1)]],
@@ -1653,19 +1687,7 @@ kernel void auc_reduce(device const float4* sorted [[buffer(0)]],
     float2 step = step_high + step_low;
     float delta = 0;
     if (p.type == 13) delta = step.y * (2 * previous.x + step.x) * 0.5f;
-    else if (step.x != 0 && total.x > 0) {
-      // The reference's interpolated PR segment, (rise - b/a log((a pr + b) /
-      // (a pr_prev + b))) / a. Its two terms nearly cancel at low precision.
-      // With offset = b * total and a * tp_prev + offset = tp_prev + fp_prev,
-      // it equals rise * precision_prev + offset (u - log1p u) / (a^2 total),
-      // where u = a * step tp / (tp_prev + fp_prev) = (step tp + step fp) / (tp_prev + fp_prev).
-      float h = step.y / step.x, a = h + 1;
-      float offset = previous.y - h * previous.x, rise = step.x / total.x;
-      float cumulative = previous.x + previous.y;
-      delta = offset == 0 ? rise / a :
-              rise * (previous.x / cumulative) +
-              offset / a / a * log1p_excess((step.x + step.y) / cumulative) / total.x;
-    }
+    else if (step.x != 0 && total.x > 0) delta = auc_pr_segment(previous, step, total.x);
     float y = delta - correction, next = area + y;
     correction = (next - area) - y; area = next;
     row = end;
