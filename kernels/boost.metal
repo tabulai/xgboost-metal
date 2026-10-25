@@ -1526,7 +1526,8 @@ kernel void metric_partial(device const float* predictions [[buffer(0)]],
         loss = float(best != uint(label)); break;
       }
       case 5: loss = -log(max(predictions[ulong(row) * p.groups + uint(label)], 1.0e-16f)); break;
-      case 6: loss = float((pred > p.parameter) != (label == 1)); break;
+      // As in the reference EvalError, a fractional label counts partially.
+      case 6: loss = pred > p.parameter ? 1 - label : label; break;
       case 7: loss = fabs((pred - label) / label); break;
       case 8: {
         float z = (pred - label) / p.parameter;
@@ -1613,33 +1614,57 @@ kernel void metric_merge(device const float4* source [[buffer(0)]],
   }
   dest[column + begin + id.x - own_begin + lo - other_begin] = value;
 }
+// The reference accumulates (tp, fp) in double. A float sum stops growing once
+// a class weight passes 2^24, so carry each sum as an unevaluated float pair
+// (high + low), which keeps about 48 significand bits.
+inline void auc_accumulate(thread float2& high, thread float2& low, float2 value) {
+  float2 sum = high + value, value_part = sum - high, high_part = sum - value_part;
+  float2 error = (high - high_part) + (value - value_part) + low;
+  high = sum + error;
+  low = error - (high - sum);
+}
+// u - log(1 + u). With z = u / (2 + u), log1p(u) = 2 atanh(z), so for small u
+// this is 2z^2 (1 + 2z/3 + z^2 + 4z^3/5 + ...) with no cancellation.
+inline float log1p_excess(float u) {
+  if (u > 0.25f) return u - log1p_stable(u);
+  float z = u / (2 + u);
+  return 2 * z * z * (1 + z * (2.0f / 3 + z * (1 + z * (0.8f + z * (1 + z * (6.0f / 7 + z * (1 + z * (8.0f / 9))))))));
+}
 kernel void auc_reduce(device const float4* sorted [[buffer(0)]],
                        device float4* output [[buffer(1)]],
                        constant MetricParams& p [[buffer(2)]],
                        uint group [[thread_position_in_grid]]) {
   if (group >= p.groups) return;
   ulong column = ulong(group) * p.stride;
-  float2 total = 0, compensation = 0;
-  for (uint r = 0; r < p.rows; ++r) {
-    float2 y = sorted[column + r].yz - compensation, next = total + y;
-    compensation = (next - total) - y; total = next;
-  }
-  float2 sum = 0;
+  float2 total_high = 0, total_low = 0;
+  for (uint r = 0; r < p.rows; ++r) auc_accumulate(total_high, total_low, sorted[column + r].yz);
+  float2 total = total_high + total_low;
+  float2 high = 0, low = 0;
   float area = 0, correction = 0;
   for (uint row = 0; row < p.rows;) {
-    float2 previous = sum;
+    // Each tie group's increment is summed on its own, so no step subtracts
+    // two nearly equal cumulative sums.
+    float2 previous = high + low, step_high = 0, step_low = 0;
     uint end = row;
     while (end < p.rows && sorted[column + end].x == sorted[column + row].x) {
-      sum += sorted[column + end].yz; ++end;
+      float2 value = sorted[column + end].yz;
+      auc_accumulate(high, low, value); auc_accumulate(step_high, step_low, value); ++end;
     }
+    float2 step = step_high + step_low;
     float delta = 0;
-    if (p.type == 13) delta = (sum.y - previous.y) * (sum.x + previous.x) * 0.5f;
-    else if (sum.x != previous.x && total.x > 0) {
-      float h = (sum.y - previous.y) / (sum.x - previous.x), a = h + 1;
-      float b = (previous.y - h * previous.x) / total.x;
-      float now = sum.x / total.x, before = previous.x / total.x;
-      delta = b == 0 ? (now - before) / a :
-              (now - before - b / a * log((a * now + b) / (a * before + b))) / a;
+    if (p.type == 13) delta = step.y * (2 * previous.x + step.x) * 0.5f;
+    else if (step.x != 0 && total.x > 0) {
+      // The reference's interpolated PR segment, (rise - b/a log((a pr + b) /
+      // (a pr_prev + b))) / a. Its two terms nearly cancel at low precision.
+      // With offset = b * total and a * tp_prev + offset = tp_prev + fp_prev,
+      // it equals rise * precision_prev + offset (u - log1p u) / (a^2 total),
+      // where u = a * step tp / (tp_prev + fp_prev) = (step tp + step fp) / (tp_prev + fp_prev).
+      float h = step.y / step.x, a = h + 1;
+      float offset = previous.y - h * previous.x, rise = step.x / total.x;
+      float cumulative = previous.x + previous.y;
+      delta = offset == 0 ? rise / a :
+              rise * (previous.x / cumulative) +
+              offset / a / a * log1p_excess((step.x + step.y) / cumulative) / total.x;
     }
     float y = delta - correction, next = area + y;
     correction = (next - area) - y; area = next;
