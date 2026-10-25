@@ -30,9 +30,9 @@ inline void add64(device atomic_uint* dst, long value) {
   atomic_fetch_add_explicit(dst + 1, uint(bits >> 32) + uint(old + low < old), memory_order_relaxed);
 }
 inline long load64(threadgroup atomic_uint* src) {
-  ulong lo = atomic_load_explicit(src, memory_order_relaxed);
-  ulong hi = atomic_load_explicit(src + 1, memory_order_relaxed);
-  return as_type<long>(lo | (hi << 32));
+  uint lo = atomic_load_explicit(src, memory_order_relaxed);
+  uint hi = atomic_load_explicit(src + 1, memory_order_relaxed);
+  return as_type<long>(uint2(lo, hi));
 }
 inline float2 load_hist(device const uint* hist, ulong offset, float2 scale) {
   ulong g = ulong(hist[offset]) | (ulong(hist[offset + 1]) << 32);
@@ -515,6 +515,10 @@ kernel void histogram_grouped(device const ushort* bins [[buffer(0)]],
   }
 }
 
+#include "histogram_missing.metal.h"
+#include "histogram_present.metal.h"
+#include "histogram_compact.metal.h"
+
 kernel void subtract_histograms(device const uint* parent [[buffer(0)]],
                                 device const HistSubtract* tasks [[buffer(1)]],
                                 device uint* histogram [[buffer(2)]],
@@ -544,6 +548,10 @@ kernel void copy_histograms(device const uint* source [[buffer(0)]],
 
 #include "split_statistics.metal.h"
 #include "scalar_gain.metal.h"
+#include "scalar_weight_fast.metal.h"
+#include "scalar_gain_fast.metal.h"
+#include "scalar_statistics_fast.metal.h"
+#include "scalar_score_fused.metal.h"
 
 inline SurvivalReal histogram_value(long integer, float scale) {
   auto value = ranking_integer(integer);
@@ -831,6 +839,12 @@ kernel void evaluate_splits_simd(device const uint* histogram [[buffer(0)]], dev
   uint winner = simd_min(best.gain == maximum && order == first ? lane : 0xffffffffu);
   if (lane == winner) output[ulong(node) * p.cols + feature] = best;
 }
+#include "scalar_sparse.metal.h"
+#include "scalar_fused.metal.h"
+#include "scalar_parallel.metal.h"
+#include "scalar_compact.metal.h"
+#include "scalar_root_parallel.metal.h"
+
 // Split long numeric features across SIMD groups. Integer carries and the
 // original forward/backward candidate positions preserve the scalar tie order.
 kernel void scalar_tile_sums(device const uint* histogram [[buffer(0)]],
@@ -1175,6 +1189,9 @@ kernel void partition_segment_copy(device const uint* source [[buffer(0)]],
   if (index < task.end) destination[index] = source[index];
 }
 
+#include "tree_driver.metal.h"
+#include "tree_driver_fused.metal.h"
+
 struct DenseRow {
   device const float* values;
   float get(uint feature) const { return values[feature]; }
@@ -1214,7 +1231,7 @@ kernel void predict(device const float* data [[buffer(0)]],
   if (id.x >= p.rows || id.y >= p.groups) return;
   ulong idx = ulong(id.x) * p.groups + id.y;
   float sum = p.has_margin ? base_margin[ulong(id.x) * p.margin_groups + id.y] : base_score[id.y];
-  for (uint t = 0; t < p.trees; ++t) {
+  for (uint t = p.tree_begin; t < p.trees; ++t) {
     TreeMeta tree = trees[t];
     if ((tree.outputs == 1 && tree.group != id.y) || tree.round < p.begin || tree.round >= p.end) continue;
     uint node = leaf_index(DenseRow{data + ulong(id.x) * p.cols}, nodes, tree.begin, categories,
@@ -1258,7 +1275,7 @@ kernel void predict_cached(device const float* data [[buffer(0)]],
   if (row >= p.rows || group >= p.groups) return;
   float sum = p.has_margin ? base_margin[ulong(row) * p.margin_groups + group] : base_score[group];
   CachedRow values{cache + lane * (p.cols | 1u), 1};
-  for (uint t = 0; t < p.trees; ++t) {
+  for (uint t = p.tree_begin; t < p.trees; ++t) {
     TreeMeta tree = trees[t];
     if ((tree.outputs == 1 && tree.group != group) || tree.round < p.begin || tree.round >= p.end) continue;
     uint node = leaf_index(values, nodes, tree.begin, categories, p.bin_partition ? category_bounds : nullptr);

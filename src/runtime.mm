@@ -12,6 +12,24 @@ namespace {
 std::string error_text(NSError* error) {
   return error ? std::string([[error localizedDescription] UTF8String]) : "unknown Metal error";
 }
+unsigned bind_buffers(id<MTLComputeCommandEncoder> encoder,
+                      std::initializer_list<Buffer> buffers) {
+  // Bind the same contiguous argument range in one call. Keep the original
+  // loop for larger lists instead of imposing a new limit on Command callers.
+  constexpr std::size_t capacity = 32;
+  unsigned index = 0;
+  if (buffers.size() > capacity) {
+    for (auto const& buffer : buffers)
+      [encoder setBuffer:(id<MTLBuffer>)buffer.native() offset:0 atIndex:index++];
+    return index;
+  }
+  id<MTLBuffer> native_buffers[capacity];
+  NSUInteger offsets[capacity]{};
+  for (auto const& buffer : buffers)
+    native_buffers[index++] = (id<MTLBuffer>)buffer.native();
+  if (index) [encoder setBuffers:native_buffers offsets:offsets withRange:NSMakeRange(0, index)];
+  return index;
+}
 }
 struct Runtime::Impl {
   id<MTLDevice> device;
@@ -93,6 +111,19 @@ Buffer Buffer::prefix(std::size_t bytes) const {
   result.bytes_ = bytes;
   return result;
 }
+bool Buffer::reserve(std::size_t bytes, std::size_t preserve_bytes) {
+  if (preserve_bytes > bytes_ || preserve_bytes > bytes)
+    throw std::invalid_argument("Buffer reserve prefix exceeds its size.");
+  if (object_ && bytes <= bytes_) return false;
+  auto device = (id<MTLDevice>)Runtime::get().device();
+  auto limit = static_cast<std::size_t>(device.maxBufferLength);
+  if (bytes > limit) throw std::runtime_error("Requested buffer exceeds Metal maxBufferLength.");
+  auto capacity = std::max(bytes, std::max<std::size_t>(64, bytes_ > limit / 2 ? limit : bytes_ * 2));
+  Buffer grown(capacity);
+  if (preserve_bytes) std::memcpy(grown.data(), data(), preserve_bytes);
+  *this = std::move(grown);
+  return true;
+}
 Command::Command(std::string_view label, bool coalesce, bool compute_fill)
     : coalesce_(coalesce), compute_fill_(compute_fill) {
   @autoreleasepool {
@@ -140,8 +171,7 @@ void Command::dispatch(std::string_view kernel, std::initializer_list<Buffer> bu
     }
     auto encoder = (id<MTLComputeCommandEncoder>)begin_compute();
     [encoder setComputePipelineState:pipeline];
-    unsigned index = 0;
-    for (auto const& buffer : buffers) [encoder setBuffer:(id<MTLBuffer>)buffer.native() offset:0 atIndex:index++];
+    auto index = bind_buffers(encoder, buffers);
     if (size) [encoder setBytes:params length:size atIndex:index];
     if (threadgroup_bytes) [encoder setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     [encoder dispatchThreadgroups:MTLSizeMake(groups.x, groups.y, groups.z)
@@ -160,8 +190,7 @@ void Command::dispatch_indirect(std::string_view kernel, std::initializer_list<B
       throw std::runtime_error("Threadgroup exceeds the Metal pipeline limit.");
     auto encoder = (id<MTLComputeCommandEncoder>)begin_compute();
     [encoder setComputePipelineState:pipeline];
-    unsigned index = 0;
-    for (auto const& buffer : buffers) [encoder setBuffer:(id<MTLBuffer>)buffer.native() offset:0 atIndex:index++];
+    auto index = bind_buffers(encoder, buffers);
     if (size) [encoder setBytes:params length:size atIndex:index];
     [encoder dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)arguments.native() indirectBufferOffset:0
                               threadsPerThreadgroup:MTLSizeMake(threads.x, threads.y, threads.z)];
@@ -184,6 +213,10 @@ void Command::zero(Buffer const& buffer) {
     [encoder fillBuffer:(id<MTLBuffer>)buffer.native() range:NSMakeRange(0, buffer.size()) value:0];
     [encoder endEncoding];
   }
+}
+void Command::set_coalescing(bool enabled) {
+  if (submitted_) throw std::logic_error("Cannot change a committed Metal command buffer.");
+  if (coalesce_ != enabled) { end_compute(); coalesce_ = enabled; }
 }
 double Command::wait() {
   @autoreleasepool {

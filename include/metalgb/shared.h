@@ -121,6 +121,21 @@ struct VectorLeafParams { SplitParams split; u32 rows, targets; float eta; u32 p
 struct PartitionParams { u32 rows, cols, nodes, padding; };
 struct PartitionTask { u32 begin, end, node, segment; };
 struct PartitionSegment { u32 begin, end, task_begin, task_end, left, right; };
+// GPU depthwise control records tree history without materializing model
+// floating-point values. The host replays the existing ApplyTreeSplit path
+// after the single tree completion wait.
+struct TreeDriverState { u32 node_count, frontier_count, depth, error; };
+struct TreeDriverParams {
+  SplitParams split;
+  HistogramPlanParams histogram;
+  PartitionParams partition;
+  u32 max_depth, node_capacity, parallel_splits, histogram_entries;
+  float min_gain;
+  u32 padding0, padding1, padding2;
+};
+struct TreeDriverDispatch { u32 x, y, z; };
+enum : u32 { kTreeDriverEvaluated = 1, kTreeDriverExpanded = 2 };
+enum : u32 { kTreeDriverCapacityError = 1, kTreeDriverNodeError = 2 };
 struct RefreshParams {
   u32 rows, cols, groups, group;
   u32 count, nodes, begin, depth;
@@ -133,6 +148,7 @@ struct PredictParams {
   u32 rows, cols, groups, trees;
   u32 begin, end, objective, type;
   u32 has_margin, margin_groups, has_tree_weights, bin_partition;
+  u32 tree_begin{0};
 };
 struct MetricParams {
   u32 rows, groups, label_cols, type;
@@ -144,6 +160,7 @@ struct MetricRatio { float high, low; i32 exponent; u32 valid; };
 #ifndef __METAL_VERSION__
 static_assert(sizeof(Node) == 48);
 static_assert(sizeof(TreeMeta) == 32);
+static_assert(sizeof(PredictParams) == 52);
 static_assert(sizeof(IntPair) == 16);
 static_assert(sizeof(SplitParams) == 64);
 static_assert(sizeof(Split) == 96);
@@ -167,5 +184,8 @@ static_assert(sizeof(RankingTile) == 16);
 static_assert(sizeof(RankingStats) == 16);
 static_assert(sizeof(RefreshParams) == 64);
 static_assert(sizeof(SamplingParams) == 48);
+static_assert(sizeof(TreeDriverState) == 16);
+static_assert(sizeof(TreeDriverParams) == 136);
+static_assert(sizeof(TreeDriverDispatch) == 12);
 }  // namespace metalgb
 #endif
