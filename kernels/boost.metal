@@ -30,9 +30,9 @@ inline void add64(device atomic_uint* dst, long value) {
   atomic_fetch_add_explicit(dst + 1, uint(bits >> 32) + uint(old + low < old), memory_order_relaxed);
 }
 inline long load64(threadgroup atomic_uint* src) {
-  ulong lo = atomic_load_explicit(src, memory_order_relaxed);
-  ulong hi = atomic_load_explicit(src + 1, memory_order_relaxed);
-  return as_type<long>(lo | (hi << 32));
+  uint lo = atomic_load_explicit(src, memory_order_relaxed);
+  uint hi = atomic_load_explicit(src + 1, memory_order_relaxed);
+  return as_type<long>(uint2(lo, hi));
 }
 inline float2 load_hist(device const uint* hist, ulong offset, float2 scale) {
   ulong g = ulong(hist[offset]) | (ulong(hist[offset + 1]) << 32);
@@ -515,6 +515,10 @@ kernel void histogram_grouped(device const ushort* bins [[buffer(0)]],
   }
 }
 
+#include "histogram_missing.metal.h"
+#include "histogram_present.metal.h"
+#include "histogram_compact.metal.h"
+
 kernel void subtract_histograms(device const uint* parent [[buffer(0)]],
                                 device const HistSubtract* tasks [[buffer(1)]],
                                 device uint* histogram [[buffer(2)]],
@@ -544,6 +548,10 @@ kernel void copy_histograms(device const uint* source [[buffer(0)]],
 
 #include "split_statistics.metal.h"
 #include "scalar_gain.metal.h"
+#include "scalar_weight_fast.metal.h"
+#include "scalar_gain_fast.metal.h"
+#include "scalar_statistics_fast.metal.h"
+#include "scalar_score_fused.metal.h"
 
 inline SurvivalReal histogram_value(long integer, float scale) {
   auto value = ranking_integer(integer);
@@ -831,6 +839,12 @@ kernel void evaluate_splits_simd(device const uint* histogram [[buffer(0)]], dev
   uint winner = simd_min(best.gain == maximum && order == first ? lane : 0xffffffffu);
   if (lane == winner) output[ulong(node) * p.cols + feature] = best;
 }
+#include "scalar_sparse.metal.h"
+#include "scalar_fused.metal.h"
+#include "scalar_parallel.metal.h"
+#include "scalar_compact.metal.h"
+#include "scalar_root_parallel.metal.h"
+
 // Split long numeric features across SIMD groups. Integer carries and the
 // original forward/backward candidate positions preserve the scalar tie order.
 kernel void scalar_tile_sums(device const uint* histogram [[buffer(0)]],
@@ -1175,6 +1189,9 @@ kernel void partition_segment_copy(device const uint* source [[buffer(0)]],
   if (index < task.end) destination[index] = source[index];
 }
 
+#include "tree_driver.metal.h"
+#include "tree_driver_fused.metal.h"
+
 struct DenseRow {
   device const float* values;
   float get(uint feature) const { return values[feature]; }
@@ -1214,7 +1231,7 @@ kernel void predict(device const float* data [[buffer(0)]],
   if (id.x >= p.rows || id.y >= p.groups) return;
   ulong idx = ulong(id.x) * p.groups + id.y;
   float sum = p.has_margin ? base_margin[ulong(id.x) * p.margin_groups + id.y] : base_score[id.y];
-  for (uint t = 0; t < p.trees; ++t) {
+  for (uint t = p.tree_begin; t < p.trees; ++t) {
     TreeMeta tree = trees[t];
     if ((tree.outputs == 1 && tree.group != id.y) || tree.round < p.begin || tree.round >= p.end) continue;
     uint node = leaf_index(DenseRow{data + ulong(id.x) * p.cols}, nodes, tree.begin, categories,
@@ -1258,7 +1275,7 @@ kernel void predict_cached(device const float* data [[buffer(0)]],
   if (row >= p.rows || group >= p.groups) return;
   float sum = p.has_margin ? base_margin[ulong(row) * p.margin_groups + group] : base_score[group];
   CachedRow values{cache + lane * (p.cols | 1u), 1};
-  for (uint t = 0; t < p.trees; ++t) {
+  for (uint t = p.tree_begin; t < p.trees; ++t) {
     TreeMeta tree = trees[t];
     if ((tree.outputs == 1 && tree.group != group) || tree.round < p.begin || tree.round >= p.end) continue;
     uint node = leaf_index(values, nodes, tree.begin, categories, p.bin_partition ? category_bounds : nullptr);
@@ -1509,7 +1526,8 @@ kernel void metric_partial(device const float* predictions [[buffer(0)]],
         loss = float(best != uint(label)); break;
       }
       case 5: loss = -log(max(predictions[ulong(row) * p.groups + uint(label)], 1.0e-16f)); break;
-      case 6: loss = float((pred > p.parameter) != (label == 1)); break;
+      // As in the reference EvalError, a fractional label counts partially.
+      case 6: loss = pred > p.parameter ? 1 - label : label; break;
       case 7: loss = fabs((pred - label) / label); break;
       case 8: {
         float z = (pred - label) / p.parameter;
@@ -1596,34 +1614,80 @@ kernel void metric_merge(device const float4* source [[buffer(0)]],
   }
   dest[column + begin + id.x - own_begin + lo - other_begin] = value;
 }
+// The reference accumulates (tp, fp) in double. A float sum stops growing once
+// a class weight passes 2^24, so carry each sum as an unevaluated float pair
+// (high + low), which keeps about 48 significand bits.
+inline void auc_accumulate(thread float2& high, thread float2& low, float2 value) {
+  float2 sum = high + value, value_part = sum - high, high_part = sum - value_part;
+  float2 error = (high - high_part) + (value - value_part) + low;
+  high = sum + error;
+  low = error - (high - sum);
+}
+inline float auc_pr_segment(float2 previous, float2 step, float positives) {
+  // The mean precision over this segment is r*L + q*(1-L), where r is
+  // previous precision, q is this tie group's precision, and
+  // L = log1p(u)/u for u = step mass / previous mass. All weights are
+  // nonnegative, avoiding cancellation between the reference formula's terms.
+  float step_scale = max(step.x, step.y);
+  float2 normalized_step = step / step_scale;
+  float q = normalized_step.x / (normalized_step.x + normalized_step.y);
+  float rise = step.x / positives;
+  float previous_scale = max(previous.x, previous.y);
+  if (previous_scale == 0) return rise * q;
+  float2 normalized_previous = previous / previous_scale;
+  float r = normalized_previous.x / (normalized_previous.x + normalized_previous.y);
+
+  // Scale before summing: each class total may be finite even when their
+  // sum overflows. Separate scales above preserve each precision ratio.
+  float scale = max(previous_scale, step_scale);
+  float2 before = previous / scale, increment = step / scale;
+  float cumulative = before.x + before.y, mass = increment.x + increment.y;
+  float retained, added;
+  if (mass <= 0.25f * cumulative) {
+    float u = mass / cumulative, z = u / (2 + u);
+    // (u - log1p(u))/u, using log1p(u) = 2*atanh(z). Computing this
+    // normalized series directly avoids cancellation and squaring tiny u.
+    added = z * (1 - z) * (1 + z * (2.0f / 3 + z * (1 + z * (0.8f + z * (1 + z * (6.0f / 7 + z * (1 + z * (8.0f / 9))))))));
+    retained = 1 - added;
+  } else if (mass <= cumulative) {
+    // Here u is bounded by one; evaluate its logarithm directly to avoid
+    // subtracting nearly equal logarithms in the reciprocal expression.
+    float u = mass / cumulative;
+    retained = log1p_stable(u) / u;
+    added = 1 - retained;
+  } else {
+    // Use the reciprocal ratio, bounded by one, so neither u nor the
+    // logarithm's intermediates can overflow. v==0 is the limiting value.
+    float v = cumulative / mass;
+    retained = v == 0 ? 0 : v * (log1p_stable(v) - log(v));
+    added = 1 - retained;
+  }
+  return rise * (r * retained + q * added);
+}
 kernel void auc_reduce(device const float4* sorted [[buffer(0)]],
                        device float4* output [[buffer(1)]],
                        constant MetricParams& p [[buffer(2)]],
                        uint group [[thread_position_in_grid]]) {
   if (group >= p.groups) return;
   ulong column = ulong(group) * p.stride;
-  float2 total = 0, compensation = 0;
-  for (uint r = 0; r < p.rows; ++r) {
-    float2 y = sorted[column + r].yz - compensation, next = total + y;
-    compensation = (next - total) - y; total = next;
-  }
-  float2 sum = 0;
+  float2 total_high = 0, total_low = 0;
+  for (uint r = 0; r < p.rows; ++r) auc_accumulate(total_high, total_low, sorted[column + r].yz);
+  float2 total = total_high + total_low;
+  float2 high = 0, low = 0;
   float area = 0, correction = 0;
   for (uint row = 0; row < p.rows;) {
-    float2 previous = sum;
+    // Each tie group's increment is summed on its own, so no step subtracts
+    // two nearly equal cumulative sums.
+    float2 previous = high + low, step_high = 0, step_low = 0;
     uint end = row;
     while (end < p.rows && sorted[column + end].x == sorted[column + row].x) {
-      sum += sorted[column + end].yz; ++end;
+      float2 value = sorted[column + end].yz;
+      auc_accumulate(high, low, value); auc_accumulate(step_high, step_low, value); ++end;
     }
+    float2 step = step_high + step_low;
     float delta = 0;
-    if (p.type == 13) delta = (sum.y - previous.y) * (sum.x + previous.x) * 0.5f;
-    else if (sum.x != previous.x && total.x > 0) {
-      float h = (sum.y - previous.y) / (sum.x - previous.x), a = h + 1;
-      float b = (previous.y - h * previous.x) / total.x;
-      float now = sum.x / total.x, before = previous.x / total.x;
-      delta = b == 0 ? (now - before) / a :
-              (now - before - b / a * log((a * now + b) / (a * before + b))) / a;
-    }
+    if (p.type == 13) delta = step.y * (2 * previous.x + step.x) * 0.5f;
+    else if (step.x != 0 && total.x > 0) delta = auc_pr_segment(previous, step, total.x);
     float y = delta - correction, next = area + y;
     correction = (next - area) - y; area = next;
     row = end;

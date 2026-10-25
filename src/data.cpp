@@ -473,7 +473,10 @@ void Matrix::refresh_metadata() {
   if (w.empty()) { std::vector<float> ones(rows, 1.0f); weights = Buffer(ones.data(), ones.size() * sizeof(float)); }
   else weights = Buffer(w.data(), w.size() * sizeof(float));
   sketch_weights = weights;
-  if (!w.empty() && !group_ptr.empty() && w.size() + 1 == group_ptr.size() && w.size() != rows) {
+  // A proxy batch keeps the previous batch's group pointers until its own
+  // query ids arrive. Expand group weights only for groups covering these rows.
+  if (!w.empty() && !group_ptr.empty() && w.size() + 1 == group_ptr.size() && w.size() != rows &&
+      group_ptr.back() == rows) {
     // Metadata expansion only. The weighted quantile calculation stays on Metal.
     std::vector<float> expanded(rows);
     for (std::size_t g = 0; g < w.size(); ++g)
@@ -665,6 +668,8 @@ std::shared_ptr<Matrix> Matrix::slice(std::span<int const> indices, bool allow_g
 void Matrix::append(Matrix const& batch) {
   require(rows == 0 || cols == batch.cols, "Iterator batches have different feature counts.");
   require(std::uint64_t(rows) + batch.rows <= UINT32_MAX, "Iterator exceeds row index range.");
+  require(batch.group_ptr.empty() || batch.group_ptr.back() == batch.rows,
+          "Query group sizes must sum to the number of rows in each iterator batch.");
   auto new_rows = rows + batch.rows;
   auto stack_shape = [&](auto left, auto const& right, std::string_view field) {
     require(!left[1] || left[1] == right[1], "Iterator batches have inconsistent metadata columns.");

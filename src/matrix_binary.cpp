@@ -66,6 +66,12 @@ std::shared_ptr<Matrix> Matrix::load_binary(std::string const& filename) {
           "Binary feature types do not match the number of columns.");
   for (auto const& type : document.feature_types)
     require(type == "q" || type == "c" || type == "int" || type == "float" || type == "i", "Invalid binary feature type.");
+  // Column sampling indexes these by feature, as set_info validates them.
+  require(document.feature_weights.empty() || document.feature_weights.size() == document.columns,
+          "Binary feature weights do not match the number of columns.");
+  require(std::all_of(document.feature_weights.begin(), document.feature_weights.end(),
+                      [](float value) { return std::isfinite(value) && value >= 0; }),
+          "Binary feature weights must be finite and nonnegative.");
   auto encoded = Json::from_ubjson(document.categories);
   require(encoded.at("enc").is_array() && encoded.at("feature_segments").is_array() &&
           encoded.at("sorted_idx").is_array(), "Invalid binary category arrays.");

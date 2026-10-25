@@ -280,24 +280,73 @@ void Learner::initialize(Matrix const& data, bool custom) {
 }
 
 void Learner::upload_model() {
+  // A deferred prediction may retain this forest's buffers. Finish it before
+  // any prefix relocation or upload can change shared storage.
+  flush_prediction_caches();
   if (forest_size_ == trees.size()) return;
-  std::vector<Node> nodes; std::vector<TreeMeta> metadata;
-  std::vector<u32> categories;
-  std::vector<float> leaf_weights;
-  for (auto const& tree : trees) {
-    metadata.push_back({static_cast<u32>(nodes.size()), static_cast<u32>(tree.nodes.size()), tree.group, tree.round,
-                        leaf_weights.size(), tree.outputs, 0});
-    leaf_weights.insert(leaf_weights.end(), tree.leaf_weights.begin(), tree.leaf_weights.end());
-    for (auto node : tree.nodes) {
-      node.category_begin += categories.size();
-      nodes.push_back(node);
-    }
-    categories.insert(categories.end(), tree.categories.begin(), tree.categories.end());
+  // Published trees are immutable. Model replacement, reconfiguration and
+  // update-mode transitions invalidate this prefix through reset().
+  bool rebuild = forest_size_ > trees.size();
+  auto first = rebuild ? 0 : forest_size_;
+  auto nodes = rebuild ? 0 : forest_node_count_;
+  auto categories = rebuild ? 0 : forest_category_count_;
+  auto leaves = rebuild ? 0 : forest_leaf_count_;
+  auto total_nodes = nodes, total_categories = categories, total_leaves = leaves;
+  auto add = [](std::size_t& count, std::size_t extra) {
+    require(extra <= std::numeric_limits<std::size_t>::max() - count, "Forest size overflow.");
+    count += extra;
+  };
+  for (std::size_t t = first; t < trees.size(); ++t) {
+    add(total_nodes, trees[t].nodes.size());
+    add(total_categories, trees[t].categories.size());
+    add(total_leaves, trees[t].leaf_weights.size());
   }
-  forest_nodes_ = upload(nodes); forest_trees_ = upload(metadata); base_buffer_ = upload(base_margin);
+  require(trees.size() <= UINT32_MAX && total_nodes <= UINT32_MAX && total_categories <= UINT32_MAX,
+          "Forest exceeds 32-bit tree, node or category offsets.");
+  auto reserve = [&](Buffer& buffer, std::size_t count, std::size_t old_count, std::size_t width) {
+    auto used = checked_product(old_count, width);
+    if (buffer.reserve(checked_product(count, width), used)) {
+      ++forest_uploads.buffer_allocations;
+      forest_uploads.bytes_relocated += used;
+    }
+  };
+  reserve(forest_nodes_, total_nodes, nodes, sizeof(Node));
+  reserve(forest_trees_, trees.size(), first, sizeof(TreeMeta));
+  reserve(forest_categories_, total_categories, categories, sizeof(u32));
+  reserve(forest_leaf_weights_, total_leaves, leaves, sizeof(float));
+  // Dropout can change weights on old trees. Keep this upload independent of
+  // the immutable node/metadata prefix, including drop_trees()' same-size path.
   if (!tree_weights_.empty() || !forest_weights_) forest_weights_ = upload(tree_weights_);
-  forest_categories_ = upload(categories);
-  forest_leaf_weights_ = upload(leaf_weights);
+  if (rebuild || !base_buffer_) base_buffer_ = upload(base_margin);
+  auto* uploaded_trees = forest_trees_.as<TreeMeta>();
+  auto* uploaded_nodes = forest_nodes_.as<Node>();
+  auto* uploaded_categories = forest_categories_.as<u32>();
+  auto* uploaded_leaves = forest_leaf_weights_.as<float>();
+  for (std::size_t t = first; t < trees.size(); ++t) {
+    auto const& tree = trees[t];
+    uploaded_trees[t] = {static_cast<u32>(nodes), static_cast<u32>(tree.nodes.size()),
+                         tree.group, tree.round, leaves, tree.outputs, 0};
+    for (auto node : tree.nodes) {
+      node.category_begin += categories;
+      uploaded_nodes[nodes++] = node;
+    }
+    if (!tree.categories.empty())
+      std::memcpy(uploaded_categories + categories, tree.categories.data(), tree.categories.size() * sizeof(u32));
+    if (!tree.leaf_weights.empty())
+      std::memcpy(uploaded_leaves + leaves, tree.leaf_weights.data(), tree.leaf_weights.size() * sizeof(float));
+    categories += tree.categories.size();
+    leaves += tree.leaf_weights.size();
+  }
+  forest_uploads.bytes_uploaded += (trees.size() - first) * sizeof(TreeMeta) +
+      (nodes - (rebuild ? 0 : forest_node_count_)) * sizeof(Node) +
+      (categories - (rebuild ? 0 : forest_category_count_)) * sizeof(u32) +
+      (leaves - (rebuild ? 0 : forest_leaf_count_)) * sizeof(float);
+  forest_uploads.trees_uploaded += trees.size() - first;
+  if (rebuild) ++forest_uploads.full_uploads;
+  else ++forest_uploads.append_uploads;
+  // Publish logical lengths last, so allocation failures leave a valid prefix
+  // for the next attempt. GPU work is complete before these shared-buffer writes.
+  forest_node_count_ = nodes; forest_category_count_ = categories; forest_leaf_count_ = leaves;
   forest_size_ = trees.size();
 }
 Learner::PredictionCache& Learner::prediction_cache(Matrix const& data) {
@@ -308,7 +357,38 @@ Learner::PredictionCache& Learner::prediction_cache(Matrix const& data) {
   auto thread = std::this_thread::get_id();
   for (auto& entry : prediction_caches_)
     if (entry.thread == thread && entry.matrix.lock().get() == &data) return entry;
-  return prediction_caches_.emplace_back(PredictionCache{data.weak_from_this(), thread, {}, 0});
+  return prediction_caches_.emplace_back(PredictionCache{data.weak_from_this(), thread, {}, 0, {}});
+}
+Buffer Learner::encode_deferred_prediction(PredictionCache& cache, Command& command) {
+  auto& deferred = *cache.deferred;
+  if (!deferred.output)
+    deferred.output = Buffer(checked_product(checked_product(deferred.params.rows, deferred.params.groups), sizeof(float)));
+  auto const& b = deferred.inputs;
+  command.dispatch("predict", {b[0], b[1], b[2], b[3], b[4], deferred.output, b[5], b[6], b[7], b[8]},
+                   deferred.params, {div_up(deferred.params.rows, 256), deferred.params.groups, 1});
+  return deferred.output;
+}
+void Learner::finish_deferred_prediction(PredictionCache& cache) {
+  cache.margins = cache.deferred->output;
+  cache.rounds = cache.deferred->rounds;
+  cache.deferred.reset();
+}
+void Learner::flush_prediction_caches() {
+  for (auto& cache : prediction_caches_) {
+    if (!cache.deferred) continue;
+    if (cache.matrix.expired()) { cache.deferred.reset(); continue; }
+    try {
+      Command command("update training predictions");
+      encode_deferred_prediction(cache, command);
+      record("prediction_cache", command.wait());
+      finish_deferred_prediction(cache);
+    } catch (...) {
+      // Keep only the known-good inputs. A retry must allocate a fresh output,
+      // never publish a partial result from a failed or unsubmitted command.
+      cache.deferred->output = {};
+      throw;
+    }
+  }
 }
 Prediction Learner::predict(Matrix const& data, Json const& config) {
   configure();
@@ -486,11 +566,40 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   }
   Buffer prediction;
   bool weighted = !is_linear() && (!tree_weights_.empty() || dropout_parameters().active());
+  auto budget = is_linear() ? static_cast<std::uint64_t>(data.rows)
+                            : static_cast<std::uint64_t>(static_cast<float>(data.rows) * number("subsample", 1));
+  bool sampling = !is_tree_update() && budget < data.rows;
+  bool fuse_gradient_root = !is_linear() && !custom_gradient && !is_tree_update() &&
+                            !has_refresh() && !sampling && objective() < 16 &&
+                            integer("metal_gradient_root_fusion", 1);
+  // Ordinary DMatrix feature storage is immutable. QuantileDMatrix can decode
+  // changed feature types into the same storage, so retain its eager boundary.
+  bool defer_prediction = fuse_gradient_root && !data.is_quantile && groups == 1 &&
+                          integer("num_parallel_tree", 1) == 1 && objective() <= 10 &&
+                          !weighted && data.get_info("base_margin").empty() &&
+                          tree_updaters_.size() == 1 && integer("metal_defer_prediction", 1);
+  if (!defer_prediction) flush_prediction_caches();
+  active_tuning["prediction_cache_deferred"] = 0;
+  active_tuning["prediction_cache_consumed"] = 0;
+  bool consumed_prediction = false;
+  struct PendingUse {
+    PredictionCache* cache{};
+    ~PendingUse() { if (cache && cache->deferred) cache->deferred->output = {}; }
+    void publish() {
+      if (!cache) return;
+      cache->margins = cache->deferred->output;
+      cache->rounds = cache->deferred->rounds;
+      cache->deferred.reset();
+      cache = nullptr;
+    }
+  } pending;
   // Custom objectives obtain their masked training margins through predict().
   // Do not draw another dropout mask while accepting their supplied gradients.
   if (!custom_gradient || !weighted) {
     auto& cached = prediction_cache(data);
-    if (!weighted && data.get_info("base_margin").empty() && cached.rounds == rounds && cached.rounds && cached.margins)
+    if (defer_prediction && cached.deferred && cached.deferred->rounds == rounds) {
+      pending.cache = &cached;
+    } else if (!weighted && data.get_info("base_margin").empty() && cached.rounds == rounds && cached.rounds && cached.margins)
       prediction = cached.margins;
     else prediction = predict(data, {{"type", 1}, {"training", custom_gradient == nullptr}}).values;
   }
@@ -514,7 +623,16 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
                                    : Buffer(checked_product(checked_product(data.rows, groups), sizeof(Pair)));
   Buffer value_gradient;
   if (custom_value_gradient) value_gradient = custom_pairs(*custom_value_gradient, custom_value_hessian, groups);
-  Command command("gradients");
+  // Keep stateful Cox/ranking, caller gradients and updater/sampling paths on their
+  // existing synchronization boundary. Ordinary gradient kernels only produce
+  // scratch buffers, so the first root can consume them before one shared wait.
+  Command command(fuse_gradient_root ? "gradients and root split" : "gradients",
+                  fuse_gradient_root && integer("metal_coalesce_encoders", 0),
+                  fuse_gradient_root && integer("metal_compute_fill", 0));
+  if (pending.cache) {
+    prediction = encode_deferred_prediction(*pending.cache, command);
+    consumed_prediction = true;
+  }
   if (!custom_gradient) {
     if (objective() == 11 || objective() == 12) smooth_gradients(command, data, prediction, gradient, p);
     else if (objective() == 13 || objective() == 14) distribution_gradients(command, data, prediction, gradient, p);
@@ -529,8 +647,6 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
     return;
   }
   Buffer scales, quantized, value_scales, quantized_values;
-  auto budget = static_cast<std::uint64_t>(static_cast<float>(data.rows) * number("subsample", 1));
-  bool sampling = !is_tree_update() && budget < data.rows;
   if (!is_tree_update() && !sampling) {
     auto quantize = [&](Buffer const& source, u32 columns, Buffer& scale, Buffer& output) {
       Buffer partial(checked_product(checked_product(div_up(data.rows, kGradientRowsPerTile), columns),
@@ -545,10 +661,14 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
     quantize(gradient, gradient_groups, scales, quantized);
     if (value_gradient && vector) quantize(value_gradient, groups, value_scales, quantized_values);
   }
-  record("gradients", command.wait());
+  if (!fuse_gradient_root) record("gradients", command.wait());
   auto parallel = integer("num_parallel_tree", 1);
   auto eta = number("learning_rate", 0.3f) / parallel;
   auto tree_groups = vector ? 1u : groups;
+  auto first_new_tree = trees.size();
+  // A failed parallel/multiclass update may have appended only part of this
+  // round. A retry must include that suffix, just like the round-filtered scan.
+  while (first_new_tree && trees[first_new_tree - 1].round == rounds) --first_new_tree;
   for (u32 group = 0; group < tree_groups; ++group) for (u32 t = 0; t < parallel; ++t) {
     SampledGradients sampled;
     if (sampling) sampled = sample_gradients(gradient, data.rows, group, static_cast<u32>(budget), t == 0,
@@ -556,7 +676,11 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
     auto tree = is_tree_update() ? std::move(trees_to_update_[trees.size()])
                                 : grow(data, sampling ? sampled.quantized : quantized,
                                        sampling ? sampled.scales : scales, group, eta, sampling,
-                                       vector ? gradient_groups : 1, vector ? groups : 1);
+                                       vector ? gradient_groups : 1, vector ? groups : 1,
+                                       fuse_gradient_root && group == 0 && t == 0 ? &command : nullptr);
+    // grow() has completed both the GPU wait and exact host materialization.
+    // No cache version was advanced if either stage threw.
+    pending.publish();
     tree.group = group; tree.round = rounds;
     if (value_gradient && vector) {
       if (sampling) {
@@ -575,20 +699,33 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   }
   normalize_trees(static_cast<std::size_t>(tree_groups) * parallel);
   ++rounds;
+  // TreeBuilder replaces the tuning map. Publish these per-update selections
+  // after tree construction so its workspace/profile reset cannot erase them.
+  active_tuning["prediction_cache_deferred"] = 0;
+  active_tuning["prediction_cache_consumed"] = consumed_prediction;
   upload_model();
   if (tree_weights_.empty()) {
     Buffer next_prediction(static_cast<std::size_t>(data.rows) * groups * sizeof(float));
     PredictParams pp{data.rows, data.cols, groups, static_cast<u32>(trees.size()), rounds - 1, rounds, objective(), 1, 1, groups, 0, 0};
-    Command cache("update training predictions");
+    pp.tree_begin = static_cast<u32>(first_new_tree);
     auto input = is_tree_update() || has_refresh() ? data.data : data.partition_data();
     auto bounds = is_tree_update() || has_refresh() ? Buffer{} : data.partition_category_bounds();
     pp.bin_partition = static_cast<u32>(static_cast<bool>(bounds));
-    cache.dispatch("predict", {input, forest_nodes_, forest_trees_, base_buffer_, prediction, next_prediction, forest_categories_, forest_weights_, forest_leaf_weights_, bounds ? bounds : base_buffer_}, pp, {div_up(data.rows, 256), groups, 1});
-    record("prediction_cache", cache.wait());
     auto& cached = prediction_cache(data);
-    cached.margins = next_prediction;
     // Prediction with a base margin resets the prefix version before growing.
-    cached.rounds = data.get_info("base_margin").empty() ? rounds : 1;
+    auto version = data.get_info("base_margin").empty() ? rounds : 1;
+    if (defer_prediction && active_tuning["gpu_tree"]) {
+      cached.deferred = DeferredPrediction{{input, forest_nodes_, forest_trees_, base_buffer_, prediction,
+                                           forest_categories_, forest_weights_, forest_leaf_weights_,
+                                           bounds ? bounds : base_buffer_}, next_prediction, pp, version};
+      active_tuning["prediction_cache_deferred"] = 1;
+    } else {
+      Command cache("update training predictions");
+      cache.dispatch("predict", {input, forest_nodes_, forest_trees_, base_buffer_, prediction, next_prediction, forest_categories_, forest_weights_, forest_leaf_weights_, bounds ? bounds : base_buffer_}, pp, {div_up(data.rows, 256), groups, 1});
+      record("prediction_cache", cache.wait());
+      cached.margins = next_prediction;
+      cached.rounds = version;
+    }
   }
   if (objective() >= 17) {
     active_tuning["ranking_cache"] = integer("metal_ranking_cache", 1);
@@ -619,6 +756,7 @@ void Learner::reset(bool clear_dropout) {
   validated_matrix_.reset();
   survival_orders_.clear();
   forest_nodes_ = {}; forest_trees_ = {}; forest_categories_ = {}; forest_weights_ = {}; forest_leaf_weights_ = {}; forest_size_ = std::numeric_limits<std::size_t>::max();
+  forest_node_count_ = 0; forest_category_count_ = 0; forest_leaf_count_ = 0;
   shap_paths_ = {}; shap_leaves_ = {}; shap_categories_ = {}; node_means_ = {}; shap_size_ = std::numeric_limits<std::size_t>::max();
 }
 std::string Learner::default_metric() const {

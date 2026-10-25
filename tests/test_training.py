@@ -171,15 +171,17 @@ def test_quantile_reference_and_metadata(regression):
     with pytest.raises(xgb.core.XGBoostError, match="max_bin"):
         xgb.train({"max_bin": 32}, d, 1)
 
-def test_gpu_profile_reports_execution(regression):
+@pytest.mark.parametrize("gpu_tree", [0, 1])
+def test_gpu_profile_reports_execution(regression, gpu_tree):
     X, y = regression
-    b = xgb.train({"max_depth": 2}, xgb.DMatrix(X, label=y), 3)
+    b = xgb.train({"max_depth": 2, "metal_gpu_tree": gpu_tree}, xgb.DMatrix(X, label=y), 3)
     out = ctypes.c_char_p()
     assert xgb.core._LIB.XGBoosterMetalProfile(b.handle, ctypes.byref(out)) == 0
     profile = json.loads(out.value)
     assert profile["command_buffers"] > 0
     assert profile["tuning"]["fused_partition"]
-    assert profile["gpu_seconds"]["tree_level"] > 0
+    assert profile["tuning"]["gpu_tree"] == gpu_tree
+    assert profile["gpu_seconds"]["gradient_tree" if gpu_tree else "tree_level"] > 0
 
 @pytest.mark.parametrize("params,match", [({"device": "cpu"}, "only"),
     ({"device": "cuda"}, "only"), ({"max_depth": -1}, "nonnegative"),

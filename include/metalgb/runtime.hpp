@@ -21,6 +21,9 @@ class Buffer {
   [[nodiscard]] std::size_t size() const { return bytes_; }
   [[nodiscard]] void* native() const { return object_.get(); }
   [[nodiscard]] Buffer prefix(std::size_t bytes) const;
+  // Grow geometrically, preserving only the initialized prefix. Returns true
+  // when a new allocation was needed; size() is the resulting byte capacity.
+  bool reserve(std::size_t bytes, std::size_t preserve_bytes);
   template <class T> [[nodiscard]] T* as() const { return static_cast<T*>(data()); }
   explicit operator bool() const { return static_cast<bool>(object_); }
   void zero() const { if (bytes_) std::memset(data(), 0, bytes_); }
@@ -69,6 +72,7 @@ class Command {
     dispatch_indirect(kernel, buffers, &params, sizeof(P), arguments, threads);
   }
   void zero(Buffer const& buffer);
+  void set_coalescing(bool enabled);
   double wait();
   [[nodiscard]] std::size_t encoder_count() const { return encoder_count_; }
  private:

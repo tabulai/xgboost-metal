@@ -251,6 +251,26 @@ def test_binary_bounds_every_metadata_field(binary_reference, tmp_path, field, p
         xgb.DMatrix(filename, silent=True)
 
 
+@pytest.mark.parametrize('corruption', ['short', 'negative'])
+def test_binary_validates_feature_weights(tmp_path, corruption):
+    # Well-formed vectors of the wrong length or sign reached column sampling,
+    # which indexes feature weights by feature id.
+    matrix = xgb.DMatrix(np.arange(24, dtype=np.float32).reshape(6, 4), label=np.arange(6, dtype=np.float32))
+    matrix.set_info(feature_weights=np.arange(1, 5, dtype=np.float32))
+    filename = tmp_path / 'weights.buffer'
+    matrix.save_binary(filename)
+    content = bytearray(filename.read_bytes())
+    entry = field_layout(content)[0]['feature_weights']
+    if corruption == 'short':
+        struct.pack_into('<QQQ', content, entry['shape'], 1, 1, 1)
+        del content[entry['values'] + 4:entry['end']]
+    else:
+        struct.pack_into('<f', content, entry['values'] + 8, -1)
+    filename.write_bytes(content)
+    with pytest.raises(xgb.core.XGBoostError, match='feature weights'):
+        xgb.DMatrix(filename, silent=True)
+
+
 @pytest.mark.parametrize('variant', ['unsorted', 'float-bits', 'future-major', 'more-fields',
                                     'trailing', 'category-search-index'])
 def test_binary_accepted_payloads_follow_cpu_canonicalization(binary_reference, tmp_path, variant):

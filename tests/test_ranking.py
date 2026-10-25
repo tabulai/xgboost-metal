@@ -1,9 +1,16 @@
 import json
+import os
 import pickle
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import numpy as np
 import pytest
 import xgboost as xgb
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def ranking_data(binary=False):
@@ -287,6 +294,82 @@ def test_ranking_iterator_query_weights(quantile):
     params = dict(objective="rank:ndcg", max_depth=2, max_bin=32)
     np.testing.assert_array_equal(xgb.train(params, data, 3).predict(data),
                                   xgb.train(params, ordinary, 3).predict(ordinary))
+
+
+def test_ranking_iterator_query_weights_with_shrinking_batches(tmp_path):
+    # A proxy batch keeps the previous batch's query groups until its own qid
+    # arrives. Expanding those groups over a smaller batch wrote past its row
+    # weights, so run out of process: heap corruption must not take down pytest.
+    script = tmp_path / "shrinking_batches.py"
+    script.write_text(textwrap.dedent("""
+        import numpy as np
+        import xgboost as xgb
+
+        rng = np.random.default_rng(5)
+        sizes = np.repeat([1024, 2, 16], 4).astype(np.uint32)
+        X = rng.integers(0, 9, (sizes.sum(), 3)).astype(np.float32)
+        y = rng.integers(0, 4, len(X)).astype(np.float32)
+        weight = np.arange(1, len(sizes) + 1, dtype=np.float32)
+        offsets = np.r_[0, np.cumsum(sizes)]
+
+        class Batches(xgb.DataIter):
+            def __init__(self):
+                self.batch = 0
+                super().__init__()
+
+            def reset(self):
+                self.batch = 0
+
+            def next(self, input_data):
+                if self.batch == 3:
+                    return False
+                g = self.batch * 4
+                begin, end = offsets[g], offsets[g + 4]
+                input_data(data=X[begin:end], label=y[begin:end], weight=weight[g:g + 4],
+                           qid=np.repeat(np.arange(g, g + 4, dtype=np.uint32), sizes[g:g + 4]))
+                self.batch += 1
+                return True
+
+        params = dict(objective="rank:ndcg", max_depth=2, max_bin=32)
+        for cls, kwargs in ((xgb.DMatrix, {}), (xgb.QuantileDMatrix, {"max_bin": 32})):
+            data = cls(Batches(), **kwargs)
+            ordinary = cls(X, label=y, group=sizes, weight=weight, **kwargs)
+            np.testing.assert_array_equal(data.get_group(), sizes)
+            np.testing.assert_array_equal(data.get_weight(), weight)
+            np.testing.assert_array_equal(xgb.train(params, data, 2).predict(data),
+                                          xgb.train(params, ordinary, 2).predict(ordinary))
+    """))
+    completed = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120,
+                               env={**os.environ, "PYTHONPATH": str(ROOT / "python-package")})
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_ranking_iterator_rejects_stale_query_groups():
+    # Without its own qid, the second batch would reuse the first batch's six
+    # rows of query groups for its four rows.
+    X = np.arange(30, dtype=np.float32).reshape(10, 3)
+    y = np.arange(10, dtype=np.float32) % 3
+
+    class Batches(xgb.DataIter):
+        def __init__(self):
+            self.batch = 0
+            super().__init__()
+
+        def reset(self):
+            self.batch = 0
+
+        def next(self, input_data):
+            if self.batch == 2:
+                return False
+            if self.batch == 0:
+                input_data(data=X[:6], label=y[:6], qid=np.repeat(np.arange(2, dtype=np.uint32), 3))
+            else:
+                input_data(data=X[6:], label=y[6:])
+            self.batch += 1
+            return True
+
+    with pytest.raises(xgb.core.XGBoostError, match="Query group sizes must sum"):
+        xgb.DMatrix(Batches())
 
 
 @pytest.mark.parametrize("seed", [-1, 4294967294])

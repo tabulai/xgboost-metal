@@ -572,5 +572,13 @@ int XGTrackerFree(TrackerHandle) { return 0; }
 
 // Optional profiling extension. Existing XGBoost entry points stay unchanged.
 extern "C" __attribute__((visibility("default"))) int XGBoosterMetalProfile(BoosterHandle h, char const** out) {
-  return booster_api(h, [&](Learner& b) { result.text = Json{{"gpu_seconds", b.gpu_seconds}, {"command_buffers", b.command_count}, {"tuning", b.active_tuning}, {"device", parse_json(Runtime::get().info())["METAL_DEVICE"]}}.dump(); *out = result.text.c_str(); });
+  return booster_api(h, [&](Learner& b) {
+    auto const& f = b.forest_uploads;
+    result.text = Json{{"gpu_seconds", b.gpu_seconds}, {"command_buffers", b.command_count},
+      {"tuning", b.active_tuning}, {"device", parse_json(Runtime::get().info())["METAL_DEVICE"]},
+      {"forest_uploads", {{"full_uploads", f.full_uploads}, {"append_uploads", f.append_uploads},
+        {"trees_uploaded", f.trees_uploaded}, {"bytes_uploaded", f.bytes_uploaded},
+        {"buffer_allocations", f.buffer_allocations}, {"bytes_relocated", f.bytes_relocated}}}}.dump();
+    *out = result.text.c_str();
+  });
 }

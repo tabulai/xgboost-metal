@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -145,6 +146,10 @@ class Learner {
   std::map<std::string, double> gpu_seconds;
   std::map<std::string, u32> active_tuning;
   std::uint64_t command_count{0};
+  struct ForestUploadStats {
+    std::uint64_t full_uploads{}, append_uploads{}, trees_uploaded{}, bytes_uploaded{};
+    std::uint64_t buffer_allocations{}, bytes_relocated{};
+  } forest_uploads;
 
   Learner();
   void prepare_objective(std::string_view name);
@@ -224,17 +229,30 @@ class Learner {
   std::size_t shap_size_{std::numeric_limits<std::size_t>::max()};
   u32 shap_leaf_count_{0};
   std::size_t forest_size_{std::numeric_limits<std::size_t>::max()};
+  std::size_t forest_node_count_{0}, forest_category_count_{0}, forest_leaf_count_{0};
   std::weak_ptr<Matrix const> validated_matrix_;
   std::uint64_t validated_generation_{0};
   u32 validated_objective_{0}, validated_classes_{0};
+  struct DeferredPrediction {
+    // Retain the exact tail-prediction inputs. No command is submitted until a
+    // consumer either combines it with gradients or flushes it synchronously.
+    std::array<Buffer, 9> inputs;
+    Buffer output;
+    PredictParams params;
+    u32 rounds;
+  };
   struct PredictionCache {
     std::weak_ptr<Matrix const> matrix;
     std::thread::id thread;
     Buffer margins;
     u32 rounds{0};
+    std::optional<DeferredPrediction> deferred;
   };
   std::vector<PredictionCache> prediction_caches_;
   PredictionCache& prediction_cache(Matrix const& data);
+  Buffer encode_deferred_prediction(PredictionCache& cache, Command& command);
+  void finish_deferred_prediction(PredictionCache& cache);
+  void flush_prediction_caches();
   bool configuration_dirty_{false}, base_score_changed_{false};
   std::mt19937 rng_{0};
   std::string rng_seed_{"0"};
@@ -297,7 +315,7 @@ class Learner {
   double survival_metric(Matrix const& data, Buffer const& prediction, u32 type);
   double metric(Matrix const& data, Buffer const& prediction, std::string const& name);
   Tree grow(Matrix& data, Buffer const& gradients, Buffer const& scales, u32 group, float eta,
-            bool compact = false, u32 targets = 1, u32 outputs = 1);
+            bool compact = false, u32 targets = 1, u32 outputs = 1, Command* root_command = nullptr);
   void update_vector_leaves(Tree& tree, Matrix const& data, Buffer const& gradient, Buffer const& scales, float eta);
 };
 }  // namespace metalgb
