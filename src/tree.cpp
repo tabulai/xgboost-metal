@@ -835,7 +835,7 @@ class TreeBuilder {
         bool parallel_root = n == 1 && nodes.front().id == 0 && nodes.front().depth == 0 &&
             parents.empty() && !sp_.use_parent_sums && parallel_splits_ && !has_categories_ &&
             data_.histogram_bins <= 256 &&
-            learner_.integer("metal_fallback_parallel_root", 0) != 0 &&
+            learner_.integer("metal_fallback_parallel_root", 1) != 0 &&
             learner_.integer("metal_parallel_root", 1) != 0 &&
             learner_.integer("metal_fast_gain", 1) != 0 &&
             learner_.integer("metal_fast_weight", 0) == 0;

@@ -59,7 +59,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="Fresh directory; never overwritten")
     parser.add_argument("--case", choices=("root", "fallback", "monotone", "interaction", "columns",
                                          "uniform", "gradient", "lossguide"), required=True)
-    parser.add_argument("--fallback-parallel-root", type=int, choices=(0, 1), default=0)
+    parser.add_argument("--fallback-parallel-root", choices=("0", "1", "default"), default="0",
+                        help="Explicit control, or default to omit the Metal parameter")
     parser.add_argument("--rows", type=int, default=65536)
     parser.add_argument("--features", type=int, default=32)
     parser.add_argument("--bins", type=int, choices=(32, 256), default=256)
@@ -71,7 +72,7 @@ def main():
     args = parser.parse_args()
     if min(args.rows, args.rounds, args.warmup_rounds, args.repeats) < 1 or args.features < 4 or args.nthread < 0:
         parser.error("Positive rows/rounds/repeats, nonnegative threads, and at least four features are required")
-    if args.backend == "cpu" and args.fallback_parallel_root:
+    if args.backend == "cpu" and args.fallback_parallel_root != "0":
         parser.error("CPU must use --fallback-parallel-root 0")
     if len(args.native_sha256) != 64 or any(c not in "0123456789abcdef" for c in args.native_sha256):
         parser.error("--native-sha256 must be a lowercase SHA256 digest")
@@ -125,7 +126,10 @@ def main():
         params.update(grow_policy="lossguide", max_depth=0, max_leaves=32)
     if metal:
         # Force the host controller for every Metal arm, including the plain depth-six control.
-        params.update(metal_gpu_tree=0, metal_fallback_parallel_root=args.fallback_parallel_root)
+        params["metal_gpu_tree"] = 0
+        if args.fallback_parallel_root != "default":
+            params["metal_fallback_parallel_root"] = int(args.fallback_parallel_root)
+    expected_fallback = 1 if args.fallback_parallel_root == "default" else int(args.fallback_parallel_root)
 
     rng = np.random.default_rng(271828)
     X = rng.integers(-128, 128, (args.rows, args.features)).astype(np.float32) / 16
@@ -138,6 +142,7 @@ def main():
                 "worker_sha256": sha(__file__), "platform": platform.platform()}
     report = {"status": "running", "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "identity": identity, "backend": args.backend, "case": args.case, "params": params,
+              "fallback_parallel_root_control": args.fallback_parallel_root,
               "rounds": args.rounds, "warmup_rounds": args.warmup_rounds, "planned_repeats": args.repeats,
               "environment": {"OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS"), **controls},
               "thread_policy": "CPU default" if args.nthread == 0 else "explicit OMP and nthread",
@@ -190,7 +195,7 @@ def main():
                 xgb.core._check_call(xgb.core._LIB.XGBoosterMetalProfile(model.handle, ctypes.byref(output)))
                 record["profile"] = json.loads(output.value)
                 tuning = record["profile"]["tuning"]
-                if tuning["gpu_tree"] or tuning.get("fallback_parallel_root", 0) != args.fallback_parallel_root:
+                if tuning["gpu_tree"] or tuning.get("fallback_parallel_root", 0) != expected_fallback:
                     raise RuntimeError(f"Unexpected dispatch selection: {tuning}")
             write(f"{prefix}.json", record)
             report["measurements"].append(record)

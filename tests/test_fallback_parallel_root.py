@@ -1,4 +1,4 @@
-"""The opt-in fallback root scorer preserves masks, constraints, and exact outputs."""
+"""Default fallback root scoring preserves masks, constraints, and exact outputs."""
 import numpy as np
 import pytest
 import xgboost as xgb
@@ -15,8 +15,10 @@ def compare(X, y, *, params=None, expected_active=1, **kwargs):
     options = {"metal_gpu_tree": 0, **(params or {})}
     expected, controls = fit(X, y, 1, params={**options, "metal_fallback_parallel_root": 0}, **kwargs)
     actual, stats = fit(X, y, 1, params={**options, "metal_fallback_parallel_root": 1}, **kwargs)
+    default, default_stats = fit(X, y, 1, params=options, **kwargs)
     assert_identical(expected, actual)
-    for trace, active in ((controls, 0), (stats, expected_active)):
+    assert_identical(expected, default)
+    for trace, active in ((controls, 0), (stats, expected_active), (default_stats, expected_active)):
         assert trace
         assert all(item["tuning"]["gpu_tree"] == 0 for item in trace)
         assert all(item["tuning"]["fallback_parallel_root"] == active for item in trace)
@@ -177,8 +179,10 @@ def test_workspace_reset_and_runtime_switches():
 def test_gpu_controller_keeps_its_existing_root_path():
     X, y = inputs(rows=513, density=0.7)
     traces = [fit(X, y, 1, bins=128, rounds=2,
-                  params={"metal_fallback_parallel_root": enabled}) for enabled in [0, 1]]
-    assert_identical(traces[0][0], traces[1][0])
+                  params={} if enabled is None else {"metal_fallback_parallel_root": enabled})
+              for enabled in [None, 0, 1]]
+    for actual, _ in traces[1:]:
+        assert_identical(traces[0][0], actual)
     for _, stats in traces:
         assert all(item["tuning"]["gpu_tree"] == 1 for item in stats)
         assert all(item["tuning"]["parallel_root"] == 1 for item in stats)

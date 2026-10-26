@@ -5,8 +5,10 @@ UTC), against `release/clean-source` commit
 `bcc18099b172d8e95497e40bf5fde3e54936212e`.
 
 `metal_fallback_parallel_root=1` reuses the existing 256-thread numeric root
-kernel in the host-driven builder. It remains **off by default**. Descendant
-splits, histogram construction, host scheduling, feature masks, monotone
+kernel in the host-driven builder. It was **off by default** in the tested
+candidate, `bfe9a0254ededdf530ca53b4d92313b7682f2d2b`; the subsequent
+[M4 validation](fallback-root-m4-20261025.md) supports enabling it by default.
+Descendant splits, histogram construction, host scheduling, feature masks, monotone
 bounds, and final root selection retain their existing implementations.
 The candidate and baseline embedded Metal libraries are byte-identical.
 See [eligibility and replay worker](benchmarking.md) for controls and exclusions.
@@ -82,7 +84,8 @@ and scheduling behavior. The profiler is not an independent CPU metric
 correctness test. No production metric code was changed. A parallel reducer
 is the strongest next target, with weighted sums, tie groups, and stable AUCPR
 integration requiring separate correctness work. General descendant split
-parallelization and M4 validation also remain future work.
+parallelization remains future work. The subsequent
+[M4 validation](fallback-root-m4-20261025.md) covers the fallback root change.
 
 Build the diagnostic against an already configured source tree:
 
