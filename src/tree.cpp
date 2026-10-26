@@ -200,7 +200,7 @@ class TreeBuilder {
                             {"tree_control_fusion", 0}, {"fused_subtraction", 0}, {"fast_weight", 0}, {"fast_gain", 0},
                             {"histogram_present", 0}, {"histogram_compact_scratch", 0}, {"histogram_clear_built", 0},
                             {"split_threads", 32}, {"fast_stats", 0}, {"compact_splits", 0}, {"parallel_root", 0}, {"fused_score", 0},
-                            {"fallback_parallel_root", 0},
+                            {"fallback_parallel_root", 0}, {"fallback_parallel_splits", 0},
                             {"gpu_tree", 0}, {"gpu_tree_levels", 0}, {"gpu_tree_scratch_bytes", 0},
                             {"tree_fixed_buffer_allocations", fixed_workspace_ ? workspace_.allocations : 4},
                             {"tree_persistent_workspace", learner.integer("metal_tree_workspace", 1) &&
@@ -211,6 +211,7 @@ class TreeBuilder {
                             {"quantile_summary_group", data.summary_group_size}, {"quantile_summary_batches", data.summary_batch_count},
                             {"quantile_weighted_summary_stages", data.weighted_summary_stages},
                             {"quantile_weighted_summary_batches", data.weighted_summary_batch_count},
+                            {"terminal_histogram_elision", 0},
                             {"tree_buffer_requests", 0}, {"tree_buffer_allocations", 0}};
   }
 
@@ -347,6 +348,23 @@ class TreeBuilder {
     if (fused_score) fused_split_kernel = "evaluate_splits_compact_subtracted_gain_stats_score";
     char const* parallel_root_kernel = fused_score ? "evaluate_splits_parallel_root_gain_stats_score" :
         fast_stats ? "evaluate_splits_parallel_root_gain_stats" : "evaluate_splits_parallel_root_gain";
+    // A terminal evaluated level only creates leaf children. Its derived
+    // histograms have no consumers after split evaluation; earlier levels
+    // still materialize complete histograms for the next subtraction.
+    bool terminal_histogram_elision = fused_subtraction && parallel_split_groups &&
+        learner_.integer("metal_terminal_histogram_elision", 1) != 0;
+    char const* terminal_split_kernel = fused_split_kernel;
+    if (terminal_histogram_elision) {
+      if (compact_splits)
+        terminal_split_kernel = fused_score ? "evaluate_splits_compact_terminal_gain_stats_score" :
+            fast_stats ? "evaluate_splits_compact_terminal_gain_stats" : "evaluate_splits_compact_terminal_gain";
+      else if (fast_stats)
+        terminal_split_kernel = fused_skip_empty_bins ? "evaluate_splits_parallel_sparse_terminal_gain_stats" :
+                                                       "evaluate_splits_parallel_terminal_gain_stats";
+      else
+        terminal_split_kernel = fused_skip_empty_bins ? "evaluate_splits_parallel_sparse_terminal_gain" :
+                                                       "evaluate_splits_parallel_terminal_gain";
+    }
     // Reused scratch is written by GPU commands between levels. Never reset
     // the workspace or memcpy over buffers referenced by an unsubmitted level.
     auto capacity = u32{1} << (max_depth_ - 1);
@@ -445,7 +463,8 @@ class TreeBuilder {
         command.dispatch_indirect("subtract_histograms", {other.histogram, subtraction, current.histogram},
                                   hp_, subtract_args);
       if (depth && fused_subtraction)
-        command.dispatch_indirect(fused_split_kernel,
+        command.dispatch_indirect(terminal_histogram_elision && depth + 1 == max_depth_ ?
+                                      terminal_split_kernel : fused_split_kernel,
                                   {current.histogram, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
                                    monotone_buffer_, bounds, allowed, candidates, data_.categorical,
                                    unused, unused, unused, current.sums, split_params,
@@ -521,6 +540,7 @@ class TreeBuilder {
     learner_.active_tuning["histogram_present"] = histogram_present;
     learner_.active_tuning["histogram_compact_scratch"] = histogram_compact_scratch;
     learner_.active_tuning["histogram_clear_built"] = histogram_clear_built;
+    learner_.active_tuning["terminal_histogram_elision"] = terminal_histogram_elision;
     learner_.active_tuning["split_threads"] = parallel_split_groups ? 256 : 32;
     learner_.active_tuning["gpu_tree_levels"] = evaluated_levels;
     learner_.active_tuning["gpu_tree_scratch_bytes"] = gpu_tree_scratch_bytes();
@@ -750,6 +770,18 @@ class TreeBuilder {
     if (!parents.empty() && fused_) segments = partition(command, parents);
     auto [parent_hist, parent_indices] = parent_histograms(command, parents);
     auto subtraction_count = subtract_ ? parents.size() : 0;
+    // Every host expansion supplies adjacent child pairs and their inherited
+    // integer totals. Reuse the existing numeric fused scorer without changing
+    // the host's feature masks, bounds, queue order, or final split selection.
+    bool fallback_parallel_splits = !vector_ && targets_ == 1 && !has_categories_ &&
+        sp_.use_parent_sums && subtraction_count && n == 2 * subtraction_count &&
+        parallel_splits_ && scalar_tiles_ == 1 && data_.histogram_bins <= 256 &&
+        learner_.integer("metal_fallback_parallel_splits", 1) != 0 &&
+        learner_.integer("metal_fused_subtraction", 1) != 0 &&
+        learner_.integer("metal_split_threads", 256) == 256 &&
+        learner_.integer("metal_fast_gain", 1) != 0 &&
+        learner_.integer("metal_fast_weight", 0) == 0;
+    bool fallback_fast_stats = fallback_parallel_splits && learner_.integer("metal_fast_stats", 1) != 0;
     Buffer hist(checked_product(n, histogram_words_) * sizeof(u32));
     command.zero(hist);
     Buffer subtraction_buffer = workspace_.get(subtraction_count * sizeof(HistSubtract));
@@ -779,7 +811,7 @@ class TreeBuilder {
       subtraction_buffer = workspace_.copy(subtraction);
       command.dispatch(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, workspace_.copy(tasks), hist}, hp_, {tasks.size(), targets_, 1});
     }
-    if (subtraction_count)
+    if (subtraction_count && !fallback_parallel_splits)
       command.dispatch("subtract_histograms", {parent_hist, subtraction_buffer, hist}, hp_,
                        {div_up(histogram_words_ / 4, 256), subtraction_count, 1});
     std::vector<Pair> bounds; for (auto const& node : nodes) bounds.push_back(node.bounds);
@@ -828,6 +860,41 @@ class TreeBuilder {
                          values, parent_sums, carries, tiles}, p, {data_.cols, n, scalar_tiles_}, {32, 1, 1});
         command.dispatch("reduce_scalar_tiles", {tiles, data_.categorical, candidates},
                          p, {data_.cols, n, 1}, {32, 1, 1});
+      } else if (fallback_parallel_splits) {
+        // Inherited totals, feature bounds and masks are fixed throughout a
+        // feature's scan. Zero integer pairs therefore duplicate the previous
+        // candidate even for dense input; the sparse kernel keeps each scan
+        // direction's first candidate and still materializes every histogram.
+        bool fallback_skip_empty_bins = learner_.integer("metal_skip_empty_bins", 1) != 0;
+        bool fallback_compact_splits = fallback_skip_empty_bins &&
+            learner_.integer("metal_compact_splits", !data_.quantized_dense) != 0;
+        bool fallback_fused_score = fallback_compact_splits && fallback_fast_stats &&
+            learner_.integer("metal_fused_score", 1) != 0;
+        char const* kernel = fallback_fast_stats ?
+            (fallback_skip_empty_bins ? "evaluate_splits_parallel_sparse_subtracted_gain_stats" :
+                                        "evaluate_splits_parallel_subtracted_gain_stats") :
+            (fallback_skip_empty_bins ? "evaluate_splits_parallel_sparse_subtracted_gain" :
+                                        "evaluate_splits_parallel_subtracted_gain");
+        if (fallback_compact_splits)
+          kernel = fallback_fused_score ? "evaluate_splits_compact_subtracted_gain_stats_score" :
+                   fallback_fast_stats ? "evaluate_splits_compact_subtracted_gain_stats" :
+                                         "evaluate_splits_compact_subtracted_gain";
+        // These kernels place SplitParams at slot 14, before the two histogram
+        // subtraction inputs. Bind a buffer there instead of appended bytes.
+        auto split_params = workspace_.copy(std::array<SplitParams, 1>{sp_});
+        command.dispatch(kernel,
+                         {hist, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
+                          monotone_buffer_, split_bounds, allowed, candidates,
+                          data_.categorical, sorted, ranks, values, parent_sums,
+                          split_params, parent_hist, subtraction_buffer}, nullptr, 0,
+                         {data_.cols, n, 1}, {256, 1, 1});
+        learner_.active_tuning["fallback_parallel_splits"] = 1;
+        learner_.active_tuning["split_skip_empty_bins"] = fallback_skip_empty_bins;
+        learner_.active_tuning["split_threads"] = 256;
+        learner_.active_tuning["fast_gain"] = 1;
+        learner_.active_tuning["fast_stats"] = fallback_fast_stats;
+        learner_.active_tuning["compact_splits"] = fallback_compact_splits;
+        learner_.active_tuning["fused_score"] = fallback_fused_score;
       } else {
         // Reuse only the numeric root kernel: it ignores inherited sums and
         // covers at most 256 bins. The host still supplies the exact sampled

@@ -109,7 +109,7 @@ def test_empty_and_pruned_frontiers_retire_without_stale_subtractions(case):
                                   "categorical", "vector", "monotone", "sampling", "no_subtraction"])
 def test_unsupported_paths_keep_the_original_subtraction(case):
     X, y = inputs(density=0.95)
-    metadata, params, bins = {}, {}, 256
+    metadata, params, bins = {}, {"metal_fallback_parallel_splits": 0}, 256
     if case == "serial":
         params["metal_parallel_splits"] = 0
     elif case == "cpu_driver":

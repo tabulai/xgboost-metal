@@ -1,7 +1,7 @@
 // Pack the union of forward/backward nonduplicate candidates into consecutive
-// lanes before scoring. The complete histogram remains materialized, and all
-// retained prefixes and candidate orders are those of the original bin scan.
-template <bool FastStats = true, bool FusedScore = false>
+// lanes before scoring. Nonterminal evaluation materializes the complete
+// histogram; retained prefixes and candidate orders match the original scan.
+template <bool FastStats = true, bool FusedScore = false, bool Materialize = true>
 inline void evaluate_compact_subtracted_feature(
     device uint* histogram, device const float2* scales,
     device const float* cuts, device const uint* counts, device const float* minima,
@@ -15,26 +15,37 @@ inline void evaluate_compact_subtracted_feature(
   if (id.x >= p.cols || id.y >= p.nodes) return;
   uint lane = tid & 31, group = tid >> 5;
   HistSubtract task = subtraction[id.y / 2];
+  long2 derived_value(0);
   if (id.y == task.other) {
     ulong entries = ulong(p.cols) * (p.bins + 1);
     ulong feature_offset = ulong(id.x) * (p.bins + 1);
     ulong parent_offset = (ulong(task.parent) * entries + feature_offset) * 4;
     ulong built_offset = (ulong(task.built) * entries + feature_offset) * 4;
     ulong output_offset = (ulong(task.other) * entries + feature_offset) * 4;
-    for (uint bin = tid; bin <= p.bins; bin += 256) {
-      long2 value = load_hist_int(parent_histogram, parent_offset + ulong(bin) * 4) -
-                    load_hist_int(histogram, built_offset + ulong(bin) * 4);
-      ulong g = as_type<ulong>(value.x), h = as_type<ulong>(value.y);
-      ulong offset = output_offset + ulong(bin) * 4;
-      histogram[offset] = uint(g); histogram[offset + 1] = uint(g >> 32);
-      histogram[offset + 2] = uint(h); histogram[offset + 3] = uint(h >> 32);
+    if (Materialize) {
+      for (uint bin = tid; bin <= p.bins; bin += 256) {
+        long2 value = load_hist_int(parent_histogram, parent_offset + ulong(bin) * 4) -
+                      load_hist_int(histogram, built_offset + ulong(bin) * 4);
+        ulong g = as_type<ulong>(value.x), h = as_type<ulong>(value.y);
+        ulong offset = output_offset + ulong(bin) * 4;
+        histogram[offset] = uint(g); histogram[offset + 1] = uint(g >> 32);
+        histogram[offset + 2] = uint(h); histogram[offset + 3] = uint(h >> 32);
+      }
+      threadgroup_barrier(mem_flags::mem_device);
+    } else if (tid < counts[id.x]) {
+      // Only the terminal evaluated level uses this specialization. No later
+      // level consumes its histogram. The parent and built sibling are ready
+      // before this dispatch; keep their exact subtraction in a register.
+      derived_value = load_hist_int(parent_histogram, parent_offset + ulong(tid) * 4) -
+                      load_hist_int(histogram, built_offset + ulong(tid) * 4);
     }
-    threadgroup_barrier(mem_flags::mem_device);
   }
   uint feature = id.x, node = id.y, count = counts[feature];
   ulong index = ulong(node) * p.cols + feature;
   ulong offset = index * (p.bins + 1) * 4;
-  long2 value = tid < count ? load_hist_int(histogram, offset + ulong(tid) * 4) : long2(0);
+  long2 value = tid < count ?
+      (!Materialize && id.y == task.other ? derived_value :
+       load_hist_int(histogram, offset + ulong(tid) * 4)) : long2(0);
   long2 prefix = histogram_prefix(value, lane);
   bool retained = tid < count && (value.x != 0 || value.y != 0 || tid == 0 || tid + 1 == count);
   uint local_rank = simd_prefix_exclusive_sum(uint(retained));
@@ -176,6 +187,30 @@ kernel void evaluate_splits_compact_subtracted_gain_stats_score(COMPACT_SPLIT_AR
   threadgroup long2 sums[8], prefixes[256];
   threadgroup uint sizes[8], bins[256], choices[25], parent[4];
   evaluate_compact_subtracted_feature<true, true>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid,
+      sums, sizes, prefixes, bins, choices, parent);
+}
+
+kernel void evaluate_splits_compact_terminal_gain(COMPACT_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8], prefixes[256];
+  threadgroup uint sizes[8], bins[256], choices[25], parent[4];
+  evaluate_compact_subtracted_feature<false, false, false>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid,
+      sums, sizes, prefixes, bins, choices, parent);
+}
+
+kernel void evaluate_splits_compact_terminal_gain_stats(COMPACT_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8], prefixes[256];
+  threadgroup uint sizes[8], bins[256], choices[25], parent[4];
+  evaluate_compact_subtracted_feature<true, false, false>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid,
+      sums, sizes, prefixes, bins, choices, parent);
+}
+
+kernel void evaluate_splits_compact_terminal_gain_stats_score(COMPACT_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8], prefixes[256];
+  threadgroup uint sizes[8], bins[256], choices[25], parent[4];
+  evaluate_compact_subtracted_feature<true, true, false>(histogram, scales, cuts, counts, minima, monotone,
       bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid,
       sums, sizes, prefixes, bins, choices, parent);
 }

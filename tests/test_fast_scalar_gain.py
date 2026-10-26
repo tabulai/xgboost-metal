@@ -114,7 +114,7 @@ def test_custom_derivatives_and_cancellation(case):
                                   "depth_one", "vector", "sampling", "large_bins", "tiled"])
 def test_ineligible_paths_keep_original_gain(case):
     X, y = inputs(density=0.95)
-    params, metadata, bins = {}, {}, 32
+    params, metadata, bins = {"metal_fallback_parallel_splits": 0}, {}, 32
     if case == "subtraction_control":
         params["metal_fused_subtraction"] = 0
     elif case == "cpu_driver":

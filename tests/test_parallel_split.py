@@ -76,7 +76,7 @@ def test_nonroot_scalar_rounding_boundaries(exponent):
                                   "depth_one", "large_bins", "tiled", "categorical", "sampling"])
 def test_unsupported_paths_keep_32_thread_selection(case):
     X, y = inputs(density=0.8)
-    params, metadata, bins = {}, {}, 128
+    params, metadata, bins = {"metal_fallback_parallel_splits": 0}, {}, 128
     if case == "cpu_driver":
         params["metal_gpu_tree"] = 0
     elif case == "serial":

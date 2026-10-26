@@ -1,7 +1,7 @@
 // Score a full numeric feature with eight SIMD groups. Integer prefix sums
 // retain every histogram contribution; the final reduction retains the old
 // forward-before-backward, first-bin tie order.
-template <bool SkipEmptyBins, bool FastStats = false>
+template <bool SkipEmptyBins, bool FastStats = false, bool Materialize = true>
 inline void evaluate_parallel_subtracted_feature(
     device uint* histogram, device const float2* scales,
     device const float* cuts, device const uint* counts, device const float* minima,
@@ -13,26 +13,37 @@ inline void evaluate_parallel_subtracted_feature(
   if (id.x >= p.cols || id.y >= p.nodes) return;
   uint lane = tid & 31, group = tid >> 5;
   HistSubtract task = subtraction[id.y / 2];
+  long2 derived_value(0);
   if (id.y == task.other) {
     ulong entries = ulong(p.cols) * (p.bins + 1);
     ulong feature_offset = ulong(id.x) * (p.bins + 1);
     ulong parent_offset = (ulong(task.parent) * entries + feature_offset) * 4;
     ulong built_offset = (ulong(task.built) * entries + feature_offset) * 4;
     ulong output_offset = (ulong(task.other) * entries + feature_offset) * 4;
-    for (uint bin = tid; bin <= p.bins; bin += 256) {
-      long2 value = load_hist_int(parent_histogram, parent_offset + ulong(bin) * 4) -
-                    load_hist_int(histogram, built_offset + ulong(bin) * 4);
-      ulong g = as_type<ulong>(value.x), h = as_type<ulong>(value.y);
-      ulong offset = output_offset + ulong(bin) * 4;
-      histogram[offset] = uint(g); histogram[offset + 1] = uint(g >> 32);
-      histogram[offset + 2] = uint(h); histogram[offset + 3] = uint(h >> 32);
+    if (Materialize) {
+      for (uint bin = tid; bin <= p.bins; bin += 256) {
+        long2 value = load_hist_int(parent_histogram, parent_offset + ulong(bin) * 4) -
+                      load_hist_int(histogram, built_offset + ulong(bin) * 4);
+        ulong g = as_type<ulong>(value.x), h = as_type<ulong>(value.y);
+        ulong offset = output_offset + ulong(bin) * 4;
+        histogram[offset] = uint(g); histogram[offset + 1] = uint(g >> 32);
+        histogram[offset + 2] = uint(h); histogram[offset + 3] = uint(h >> 32);
+      }
+      threadgroup_barrier(mem_flags::mem_device);
+    } else if (tid < counts[id.x]) {
+      // Only the terminal evaluated level uses this specialization. No later
+      // level consumes its histogram. The parent and built sibling are ready
+      // before this dispatch; keep their exact subtraction in a register.
+      derived_value = load_hist_int(parent_histogram, parent_offset + ulong(tid) * 4) -
+                      load_hist_int(histogram, built_offset + ulong(tid) * 4);
     }
-    threadgroup_barrier(mem_flags::mem_device);
   }
   uint feature = id.x, node = id.y, count = counts[feature];
   ulong index = ulong(node) * p.cols + feature;
   ulong offset = index * (p.bins + 1) * 4;
-  long2 value = tid < count ? load_hist_int(histogram, offset + ulong(tid) * 4) : long2(0);
+  long2 value = tid < count ?
+      (!Materialize && id.y == task.other ? derived_value :
+       load_hist_int(histogram, offset + ulong(tid) * 4)) : long2(0);
   long2 prefix = histogram_prefix(value, lane);
   if (lane == 31) group_sums[group] = prefix;
   long2 total_int = node_sums[node];
@@ -144,4 +155,31 @@ kernel void evaluate_splits_parallel_sparse_subtracted_gain_stats(PARALLEL_SPLIT
       bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid, sums, choices, parent);
 }
 
+kernel void evaluate_splits_parallel_terminal_gain(PARALLEL_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8];
+  threadgroup uint choices[25], parent[4];
+  evaluate_parallel_subtracted_feature<false, false, false>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid, sums, choices, parent);
+}
+
+kernel void evaluate_splits_parallel_terminal_gain_stats(PARALLEL_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8];
+  threadgroup uint choices[25], parent[4];
+  evaluate_parallel_subtracted_feature<false, true, false>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid, sums, choices, parent);
+}
+
+kernel void evaluate_splits_parallel_sparse_terminal_gain(PARALLEL_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8];
+  threadgroup uint choices[25], parent[4];
+  evaluate_parallel_subtracted_feature<true, false, false>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid, sums, choices, parent);
+}
+
+kernel void evaluate_splits_parallel_sparse_terminal_gain_stats(PARALLEL_SPLIT_ARGUMENTS) {
+  threadgroup long2 sums[8];
+  threadgroup uint choices[25], parent[4];
+  evaluate_parallel_subtracted_feature<true, true, false>(histogram, scales, cuts, counts, minima, monotone,
+      bounds, allowed, output, node_sums, p, parent_histogram, subtraction, id, tid, sums, choices, parent);
+}
 #undef PARALLEL_SPLIT_ARGUMENTS

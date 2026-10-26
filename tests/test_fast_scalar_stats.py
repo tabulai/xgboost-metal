@@ -43,6 +43,7 @@ def test_signed_statistics_and_scale_rounding(threads, exponent):
 ])
 def test_unsupported_scoring_keeps_original_conversion(control):
     X, y = inputs(rows=513, density=0.5)
+    control = {**control, "metal_fallback_parallel_splits": 0}
     expected, _ = fit(X, y, 1, rounds=2, params={**control, "metal_fast_stats": 0})
     actual, profiles = fit(X, y, 1, rounds=2, params={**control, "metal_fast_stats": 1})
     assert_identical(expected, actual)

@@ -81,7 +81,8 @@ def test_dense_regularization_retains_candidate_scores(params):
                                   "subtraction_control", "monotone", "sampling"])
 def test_dense_fallbacks_retain_original_kernel(case):
     X, y = dense_data()
-    params, bins = {}, 128
+    # Isolate the original host kernels from the separate descendant path.
+    params, bins = {"metal_fallback_parallel_splits": 0}, 128
     if case == "cpu_driver":
         params["metal_gpu_tree"] = 0
     elif case == "serial":
@@ -122,7 +123,8 @@ def test_all_fused_arithmetic_variants(weight, gain):
 def test_dense_gpu_matches_original_cpu_tree_driver(depth):
     X, y = dense_data()
     expected, controls = fit(X, y, 1, bins=128, rounds=3,
-                             params={"max_depth": depth, "metal_gpu_tree": 0, "metal_skip_empty_bins": 0})
+                             params={"max_depth": depth, "metal_gpu_tree": 0, "metal_skip_empty_bins": 0,
+                                     "metal_fallback_parallel_splits": 0})
     actual, stats = compare(X, y, bins=128, params={"max_depth": depth}, rounds=3)
     assert all(item["tuning"]["gpu_tree"] == 0 for item in controls)
     assert all(item["tuning"]["gpu_tree"] == 1 for item in stats)
