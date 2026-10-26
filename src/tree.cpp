@@ -200,6 +200,7 @@ class TreeBuilder {
                             {"tree_control_fusion", 0}, {"fused_subtraction", 0}, {"fast_weight", 0}, {"fast_gain", 0},
                             {"histogram_present", 0}, {"histogram_compact_scratch", 0}, {"histogram_clear_built", 0},
                             {"split_threads", 32}, {"fast_stats", 0}, {"compact_splits", 0}, {"parallel_root", 0}, {"fused_score", 0},
+                            {"fallback_parallel_root", 0},
                             {"gpu_tree", 0}, {"gpu_tree_levels", 0}, {"gpu_tree_scratch_bytes", 0},
                             {"tree_fixed_buffer_allocations", fixed_workspace_ ? workspace_.allocations : 4},
                             {"tree_persistent_workspace", learner.integer("metal_tree_workspace", 1) &&
@@ -828,10 +829,26 @@ class TreeBuilder {
         command.dispatch("reduce_scalar_tiles", {tiles, data_.categorical, candidates},
                          p, {data_.cols, n, 1}, {32, 1, 1});
       } else {
-        command.dispatch(split_kernel(), {hist, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
-                                            monotone_buffer_, split_bounds, allowed, candidates,
-                                            data_.categorical, sorted, ranks, values, parent_sums}, sp_,
-                         {parallel_splits_ ? data_.cols : div_up(data_.cols, 64), n, 1}, {parallel_splits_ ? 32u : 64u, 1, 1});
+        // Reuse only the numeric root kernel: it ignores inherited sums and
+        // covers at most 256 bins. The host still supplies the exact sampled
+        // feature mask and monotone bounds, then selects and applies the split.
+        bool parallel_root = n == 1 && nodes.front().id == 0 && nodes.front().depth == 0 &&
+            parents.empty() && !sp_.use_parent_sums && parallel_splits_ && !has_categories_ &&
+            data_.histogram_bins <= 256 &&
+            learner_.integer("metal_fallback_parallel_root", 0) != 0 &&
+            learner_.integer("metal_parallel_root", 1) != 0 &&
+            learner_.integer("metal_fast_gain", 1) != 0 &&
+            learner_.integer("metal_fast_weight", 0) == 0;
+        command.dispatch(parallel_root ? "evaluate_splits_parallel_root_gain" : split_kernel(),
+                         {hist, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
+                          monotone_buffer_, split_bounds, allowed, candidates,
+                          data_.categorical, sorted, ranks, values, parent_sums}, sp_,
+                         {parallel_splits_ ? data_.cols : div_up(data_.cols, 64), n, 1},
+                         {parallel_root ? 256u : parallel_splits_ ? 32u : 64u, 1, 1});
+        if (parallel_root) {
+          learner_.active_tuning["parallel_root"] = 1;
+          learner_.active_tuning["fallback_parallel_root"] = 1;
+        }
       }
       if (!sp_.use_parent_sums && data_.quantized_dense) {
         command.dispatch("select_dense_root_split", {candidates, best, scales_, split_bounds, hist,
