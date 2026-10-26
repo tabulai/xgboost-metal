@@ -99,6 +99,8 @@ def test_ineligible_paths_keep_original_root(case):
         metadata["feature_types"] = ["c"] + ["q"] * 6
     else:
         params["subsample"] = 0.7
+    # This test isolates GPU-driver eligibility; fallback roots have their own control.
+    params["metal_fallback_parallel_root"] = 0
     compare(X, y, bins=bins, params=params, metadata=metadata, expected_active=0, rounds=2)
 
 

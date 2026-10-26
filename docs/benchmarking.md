@@ -150,6 +150,37 @@ At depth ten, every nonterminal expansion fits the reference driver's
 terminal children; applying them in increasing node order preserves the two
 reference batches' model layout. Deeper trees still use the original driver.
 
+The default `metal_fallback_parallel_root=1` path also lets the original
+host-driven builder use the existing 256-thread numeric root splitter. Set it
+to zero for the original root evaluator. Selection requires scalar numeric input
+with at most 256 bins, untiled parallel split evaluation,
+`metal_parallel_root=1`, `metal_fast_gain=1`, and `metal_fast_weight=0`.
+The host still supplies the
+original feature mask and monotone bounds, schedules subsequent nodes, and
+assembles the model. Categorical, vector, tiled, and larger-bin roots retain
+their previous evaluation, as do all nonroot nodes.
+
+The latest-tree `fallback_parallel_root` field reports actual selection;
+`parallel_root` is also one when this root kernel runs. `gpu_tree` remains zero
+and `split_threads` continues to describe the nonroot splitter. This option
+does not remove command-buffer waits or histogram allocations. Measure its
+total-fit benefit separately for shallow and deep trees, using an explicit
+zero as the same-binary control.
+
+`benchmarks/fallback_numeric.py` runs one pinned baseline, candidate, or CPU
+worker and saves each repeat's predictions, original JSON/UBJ model, canonical
+comparison JSON, timings, and dispatch profile. Its required package path and
+native SHA-256 prevent accidental use of an installed library. Run separate
+processes with the option off and on, alternate their order, and compare saved
+outputs before interpreting timings. Use `--fallback-parallel-root default`
+to omit the parameter and validate default selection. Use `OMP_NUM_THREADS=1`
+with the default `--nthread 1` for Metal comparisons; the CPU performance
+baseline can use `--nthread 0` with `OMP_NUM_THREADS` unset.
+See `--help` for workload and output options.
+The [M1 experiment](fallback-root-m1-20261025.md) and
+[M4 validation](fallback-root-m4-20261025.md) record measured benefits,
+exactness checks, and the limits of this root-only optimization.
+
 When quantized input contains missing values, `metal_histogram_missing=1`
 accumulates their integer gradient/Hessian sums privately and reduces them
 within each SIMD group. Each group publishes one sum instead of every missing
@@ -253,8 +284,9 @@ always uses 256 threads, including when `metal_split_threads=32` is requested;
 set `metal_compact_splits=0` to measure the noncompact splitter. Compaction
 requires empty-bin skipping, so `metal_skip_empty_bins=0` disables it.
 
-Fast statistics, the wider splitters, and compaction require the scalar numeric
-GPU loop, fused subtraction and fast gain, with fast weight disabled. Existing
+These GPU-loop variants require scalar numeric input, fused subtraction and
+fast gain, with fast weight disabled. The separately controlled fallback root
+splitter described above has its own narrower eligibility checks. Existing
 unsupported configurations retain their previous scoring paths. Latest-tree
 fields `fast_stats`, `parallel_root`, `compact_splits`, and `split_threads`
 describe selected paths and widths; they are not candidate or arithmetic hit
