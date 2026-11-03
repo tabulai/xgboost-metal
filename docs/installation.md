@@ -1,6 +1,6 @@
 # Installation
 
-XGBoost Apple GPU requires an Apple silicon Mac, macOS 14 or later, and
+xgboost-metal requires an Apple silicon Mac, macOS 14 or later, and
 Python 3.10 or later. Source builds require Xcode with the Metal compiler and
 a C++20 compiler. The build backend uses CMake 3.24 or later.
 
@@ -10,8 +10,8 @@ Create a dedicated environment. Upstream XGBoost and this distribution use the
 same Python import name and should be installed in separate environments.
 
 ```sh
-git clone https://github.com/Int21-AI/XGBoost-AppleGPU.git
-cd XGBoost-AppleGPU
+git clone https://github.com/tabulai/xgboost-metal.git
+cd xgboost-metal
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip

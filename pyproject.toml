@@ -12,9 +12,9 @@ license = {file = "LICENSE"}
 dependencies = ["numpy", "scipy"]
 
 [project.urls]
-Repository = "https://github.com/Int21-AI/XGBoost-AppleGPU"
-Documentation = "https://github.com/Int21-AI/XGBoost-AppleGPU#documentation"
-Issues = "https://github.com/Int21-AI/XGBoost-AppleGPU/issues"
+Repository = "https://github.com/tabulai/xgboost-metal"
+Documentation = "https://github.com/tabulai/xgboost-metal#documentation"
+Issues = "https://github.com/tabulai/xgboost-metal/issues"
 
 [project.optional-dependencies]
 sklearn = ["scikit-learn", "pandas"]
@@ -23,7 +23,7 @@ test = ["pytest", "scikit-learn", "pandas", "pyarrow"]
 [tool.scikit-build]
 wheel.packages = ["python-package/xgboost"]
 wheel.py-api = "py3"
-wheel.license-files = ["LICENSE", "THIRD_PARTY.md", "third_party/nlohmann/LICENSE.MIT", "third_party/llvm/LICENSE.TXT"]
+wheel.license-files = ["LICENSE", "NOTICE", "THIRD_PARTY.md", "third_party/nlohmann/LICENSE.MIT", "third_party/llvm/LICENSE.TXT"]
 cmake.build-type = "Release"
 cmake.define.CMAKE_OSX_DEPLOYMENT_TARGET = "14.0"
 build-dir = "build/{wheel_tag}"

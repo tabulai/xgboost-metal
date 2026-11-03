@@ -39,7 +39,7 @@ def main():
         assert actual_python == expected_python.keys(), actual_python.symmetric_difference(expected_python)
         metadata = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
         assert (root / "README.md").read_bytes().strip() in wheel.read(metadata), "README metadata differs"
-        for path in ("LICENSE", "THIRD_PARTY.md", "third_party/nlohmann/LICENSE.MIT", "third_party/llvm/LICENSE.TXT"):
+        for path in ("LICENSE", "NOTICE", "THIRD_PARTY.md", "third_party/nlohmann/LICENSE.MIT", "third_party/llvm/LICENSE.TXT"):
             name = next(name for name in wheel.namelist() if name.endswith(".dist-info/licenses/" + path))
             assert wheel.read(name) == (root / path).read_bytes(), path
     report = {
