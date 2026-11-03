@@ -113,7 +113,7 @@ def test_empty_frontiers_and_unsplit_root_weights(case):
 ])
 def test_unsupported_paths_keep_standalone_helpers(params):
     X, y = inputs(rows=513, density=0.6)
-    params = dict(params)
+    params = {**params, "metal_fallback_parallel_splits": 0}
     bins = params.pop("max_bin", 32)
     compare(X, y, bins=bins, params=params, rounds=2, expected_active=0)
 
