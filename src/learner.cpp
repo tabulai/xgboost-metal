@@ -21,6 +21,51 @@ bool needs_prediction_transform(u32 objective, u32 groups, bool evaluation) {
 }
 }
 Learner::Learner() { Runtime::get(); }
+Learner::~Learner() { abandon_rounds(); }
+Buffer Learner::pooled_buffer(std::vector<Buffer>& pool, std::size_t bytes) {
+  // A pooled buffer is free once the pool holds its only host reference:
+  // no cache, recipe, caller result or round in flight can still read it.
+  Buffer* best = nullptr;
+  for (auto& buffer : pool)
+    if (buffer.use_count() == 1 && buffer.size() >= bytes && (!best || buffer.size() < best->size())) best = &buffer;
+  if (best) return best->prefix(bytes);
+  if (pool.size() >= 64) std::erase_if(pool, [](Buffer const& buffer) { return buffer.use_count() == 1; });
+  return pool.emplace_back(bytes).prefix(bytes);
+}
+Buffer Learner::round_output(std::size_t bytes) { return pooled_buffer(round_output_pool_, bytes); }
+void Learner::retire_round() {
+  auto round = std::move(inflight_.front());
+  inflight_.pop_front();
+  try {
+    record("gradient_tree", round.command->wait());
+    u32 levels = 0;
+    auto tree = replay_gpu_tree(round.tree, levels);
+    // The next round's margins were computed from the emitted table, so it
+    // must equal the host model byte for byte before the tree is published.
+    auto const& meta = *round.tree.meta.as<TreeMeta>();
+    require(meta.count == tree.nodes.size() &&
+            !std::memcmp(round.tree.nodes.data(), tree.nodes.data(), tree.nodes.size() * sizeof(Node)),
+            "GPU-emitted tree nodes differ from the host replay.");
+    trees.push_back(std::move(tree));
+    if (round.tree.round == async_tuning_round_) active_tuning["gpu_tree_levels"] = levels;
+  } catch (...) {
+    // Every later round derived its gradients from this round's margins.
+    // Drop them and recompute training margins from the retained model.
+    // Entries stay in place: an update interrupted by this retirement may
+    // still reference its cache.
+    abandon_rounds();
+    rounds = round.tree.round;
+    for (auto& cache : prediction_caches_) { cache.margins = {}; cache.rounds = 0; cache.deferred.reset(); }
+    throw;
+  }
+}
+void Learner::abandon_rounds() noexcept {
+  for (auto& round : inflight_) {
+    try { round.command->wait(); } catch (...) {}
+  }
+  inflight_.clear();
+}
+void Learner::drain() { while (!inflight_.empty()) retire_round(); }
 std::string Learner::str(std::string_view key, std::string fallback) const {
   auto it = params.find(key); return it == params.end() ? fallback : it->second;
 }
@@ -94,6 +139,10 @@ void Learner::set_param(std::string key, std::string value) {
     if (name.starts_with("ndcg")) config["ndcg_exp_gain"] = boolean("ndcg_exp_gain", true) ? "1" : "0";
 }
 void Learner::configure() {
+  // Booster switches, update mode and output/base-score changes rewrite the
+  // model below. Retire committed asynchronous rounds first.
+  if (!inflight_.empty() && (str("booster", "gbtree") != "gbtree" || configuration_dirty_ ||
+                             str("process_type", "default") != "default")) drain();
   if (str("booster", "gbtree") == "dart") {
     static std::once_flag warned;
     std::call_once(warned, [this] {
@@ -179,15 +228,19 @@ void Learner::initialize(Matrix const& data, bool custom) {
   auto expected_weights = obj >= 17 ? (data.group_ptr.empty() ? 1 : data.group_ptr.size() - 1) : data.rows;
   require(data.get_info("weight").empty() || data.get_info("weight").size() == expected_weights,
           obj >= 17 ? "Ranking weights must have one entry per query group." : "Number of weights must equal the number of rows.");
-  if (obj == 1 || obj == 2) require(number("scale_pos_weight", 1) >= 0, "scale_pos_weight must be nonnegative.");
-  require(is_linear() || str("booster", "gbtree") == "gbtree", "Booster is not implemented by the Metal backend: " + str("booster"));
+  // These checks depend only on parameters. While the parameters equal the
+  // last fully validated set (metal_parameter_snapshot), skip re-parsing them.
+  bool snapshot = integer("metal_parameter_snapshot", 1) != 0;
+  bool validate = !snapshot || params != validated_params_;
+  if (validate && (obj == 1 || obj == 2)) require(number("scale_pos_weight", 1) >= 0, "scale_pos_weight must be nonnegative.");
+  if (validate) require(is_linear() || str("booster", "gbtree") == "gbtree", "Booster is not implemented by the Metal backend: " + str("booster"));
   if (is_linear()) {
     require(!data.is_quantile, "gblinear does not support QuantileDMatrix.");
     require(std::none_of(data.feature_types.begin(), data.feature_types.end(), [](auto const& type) { return type == "c"; }),
             "Categorical features are not supported by gblinear.");
     require(obj < 17 || data.get_info("weight").empty() || data.get_info("weight").size() == data.rows,
             "gblinear cannot normalize query weights as per-row instance weights.");
-  } else {
+  } else if (validate) {
   if (!params.contains("updater"))
     require(str("tree_method", "hist") == "hist" || str("tree_method", "hist") == "auto", "Metal tree training requires tree_method='hist' or 'auto'.");
   else require(str("tree_method", "hist") == "hist" || str("tree_method") == "auto" || str("tree_method") == "exact" || str("tree_method") == "approx", "Invalid tree_method.");
@@ -224,8 +277,11 @@ void Learner::initialize(Matrix const& data, bool custom) {
     validated_matrix_ = data.weak_from_this(); validated_generation_ = data.generation;
     validated_objective_ = obj; validated_classes_ = classes;
   }
-  if (obj == 8) require(number("tweedie_variance_power", 1.5f) >= 1 && number("tweedie_variance_power", 1.5f) < 2, "tweedie_variance_power must be in [1, 2).");
-  if (obj == 9) require(number("huber_slope", 1) > 0, "huber_slope must be positive.");
+  if (validate) {
+    if (obj == 8) require(number("tweedie_variance_power", 1.5f) >= 1 && number("tweedie_variance_power", 1.5f) < 2, "tweedie_variance_power must be in [1, 2).");
+    if (obj == 9) require(number("huber_slope", 1) > 0, "huber_slope must be positive.");
+    if (snapshot) validated_params_ = params;
+  }
   if (initialized) {
     require(num_feature == data.cols, "Number of columns does not match the trained model.");
     require(custom || num_target == (obj == 14 ? 2 : !levels.empty() ? levels.size() : data.label_cols) || num_class > 0,
@@ -391,6 +447,7 @@ void Learner::flush_prediction_caches() {
   }
 }
 Prediction Learner::predict(Matrix const& data, Json const& config) {
+  drain();
   configure();
   if (config.value("training", false)) initialize(data, true);
   require(initialized, "Model is not yet initialized (not fitted).");
@@ -578,6 +635,15 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
                           integer("num_parallel_tree", 1) == 1 && objective() <= 10 &&
                           !weighted && data.get_info("base_margin").empty() &&
                           tree_updaters_.size() == 1 && integer("metal_defer_prediction", 1);
+  auto async_depth = integer("metal_async_rounds", 0);
+  require(async_depth <= 4, "metal_async_rounds must be in [0, 4].");
+  // Asynchronous rounds extend deferred updates: the next margin update reads
+  // a GPU-emitted Node table, so an eligible GPU-driven round returns before
+  // its command completes. Other updates first retire committed rounds.
+  bool async = defer_prediction && async_depth;
+  if (!async) drain();
+  // Retirement during this call must not report an older tree's depth.
+  async_tuning_round_ = UINT32_MAX;
   if (!defer_prediction) flush_prediction_caches();
   active_tuning["prediction_cache_deferred"] = 0;
   active_tuning["prediction_cache_consumed"] = 0;
@@ -619,16 +685,27 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
     }
     return pairs;
   };
-  Buffer gradient = custom_gradient ? custom_pairs(*custom_gradient, custom_hessian, gradient_groups)
-                                   : Buffer(checked_product(checked_product(data.rows, groups), sizeof(Pair)));
+  // Round scratch is fully overwritten by its producing kernels before any
+  // read, and the host never touches it, so it can persist across rounds.
+  bool round_buffers = integer("metal_round_buffers", 1) != 0;
+  auto scratch = [&](Buffer& slot, std::size_t bytes) {
+    if (!round_buffers) return Buffer(bytes);
+    if (!slot || slot.size() < bytes) slot = Buffer(bytes);
+    return slot.prefix(bytes);
+  };
+  auto gradient_bytes = checked_product(checked_product(data.rows, groups), sizeof(Pair));
+  Buffer gradient = custom_gradient ? custom_pairs(*custom_gradient, custom_hessian, gradient_groups) :
+                    !is_linear() && objective() <= 10 ? scratch(round_buffers_.gradient, gradient_bytes) :
+                    Buffer(gradient_bytes);
   Buffer value_gradient;
   if (custom_value_gradient) value_gradient = custom_pairs(*custom_value_gradient, custom_value_hessian, groups);
   // Keep stateful Cox/ranking, caller gradients and updater/sampling paths on their
   // existing synchronization boundary. Ordinary gradient kernels only produce
   // scratch buffers, so the first root can consume them before one shared wait.
-  Command command(fuse_gradient_root ? "gradients and root split" : "gradients",
-                  fuse_gradient_root && integer("metal_coalesce_encoders", 0),
-                  fuse_gradient_root && integer("metal_compute_fill", 0));
+  bool coalesce_prologue = fuse_gradient_root && integer("metal_coalesce_encoders", 0);
+  auto owned_command = std::make_unique<Command>(fuse_gradient_root ? "gradients and root split" : "gradients",
+                                                 coalesce_prologue, fuse_gradient_root && integer("metal_compute_fill", 0));
+  auto& command = *owned_command;
   if (pending.cache) {
     prediction = encode_deferred_prediction(*pending.cache, command);
     consumed_prediction = true;
@@ -648,36 +725,46 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   }
   Buffer scales, quantized, value_scales, quantized_values;
   if (!is_tree_update() && !sampling) {
-    auto quantize = [&](Buffer const& source, u32 columns, Buffer& scale, Buffer& output) {
-      Buffer partial(checked_product(checked_product(div_up(data.rows, kGradientRowsPerTile), columns),
-                                     kGradientPartialWords * sizeof(u32)));
-      scale = Buffer(checked_product(columns, sizeof(Pair)));
-      output = Buffer(checked_product(checked_product(data.rows, columns), 2 * sizeof(std::int64_t)));
+    auto quantize = [&](Buffer const& source, u32 columns, Buffer& scale, Buffer& output, bool values) {
+      Buffer partial = scratch(values ? round_buffers_.value_partial : round_buffers_.partial,
+                               checked_product(checked_product(div_up(data.rows, kGradientRowsPerTile), columns),
+                                               kGradientPartialWords * sizeof(u32)));
+      scale = scratch(values ? round_buffers_.value_scale : round_buffers_.scale, checked_product(columns, sizeof(Pair)));
+      output = scratch(values ? round_buffers_.value_quantized : round_buffers_.quantized,
+                       checked_product(checked_product(data.rows, columns), 2 * sizeof(std::int64_t)));
       auto qp = p; qp.groups = columns;
       command.dispatch("gradient_partial_sums", {source, partial}, qp, {div_up(data.rows, kGradientRowsPerTile), columns, 1});
       command.dispatch("gradient_scales", {partial, scale}, qp, {2, columns, 1});
       command.dispatch("quantize_gradients", {source, scale, output}, qp, {div_up(data.rows, 256), columns, 1});
     };
-    quantize(gradient, gradient_groups, scales, quantized);
-    if (value_gradient && vector) quantize(value_gradient, groups, value_scales, quantized_values);
+    quantize(gradient, gradient_groups, scales, quantized, false);
+    if (value_gradient && vector) quantize(value_gradient, groups, value_scales, quantized_values, true);
   }
   if (!fuse_gradient_root) record("gradients", command.wait());
+  // Start the prologue while the host builds and encodes the tree. One wait
+  // still covers both command buffers. Explicitly coalesced prologues keep
+  // their single encoder; asynchronous rounds already overlap host work with
+  // the previous round, so a second command buffer would only add overhead.
+  bool commit_early = fuse_gradient_root && !coalesce_prologue && !async &&
+                      integer("metal_commit_early", 1) != 0;
+  if (commit_early) command.flush();
   auto parallel = integer("num_parallel_tree", 1);
   auto eta = number("learning_rate", 0.3f) / parallel;
   auto tree_groups = vector ? 1u : groups;
-  auto first_new_tree = trees.size();
-  // A failed parallel/multiclass update may have appended only part of this
-  // round. A retry must include that suffix, just like the round-filtered scan.
-  while (first_new_tree && trees[first_new_tree - 1].round == rounds) --first_new_tree;
+  GpuTreeRound async_tree;
   for (u32 group = 0; group < tree_groups; ++group) for (u32 t = 0; t < parallel; ++t) {
     SampledGradients sampled;
     if (sampling) sampled = sample_gradients(gradient, data.rows, group, static_cast<u32>(budget), t == 0,
                                              vector ? gradient_groups : 1, gradient_groups);
+    bool root = fuse_gradient_root && group == 0 && t == 0;
     auto tree = is_tree_update() ? std::move(trees_to_update_[trees.size()])
                                 : grow(data, sampling ? sampled.quantized : quantized,
                                        sampling ? sampled.scales : scales, group, eta, sampling,
                                        vector ? gradient_groups : 1, vector ? groups : 1,
-                                       fuse_gradient_root && group == 0 && t == 0 ? &command : nullptr);
+                                       root ? &command : nullptr, root && async ? &async_tree : nullptr);
+    // An asynchronous GPU tree is still being built; eligibility implies a
+    // single tree per round. Its cache version is published after commit.
+    if (async_tree) break;
     // grow() has completed both the GPU wait and exact host materialization.
     // No cache version was advanced if either stage threw.
     pending.publish();
@@ -697,15 +784,52 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
         modify_tree(tree, data, sampled_refresh ? sampled.values : gradient, eta, updater, sampled_refresh);
     trees.push_back(std::move(tree));
   }
+  auto margin_bytes = static_cast<std::size_t>(data.rows) * groups * sizeof(float);
+  if (async_tree) {
+    auto next_prediction = round_buffers ? pooled_buffer(margin_pool_, margin_bytes) : Buffer(margin_bytes);
+    command.commit();
+    inflight_.push_back(InFlightRound{std::move(owned_command), async_tree});
+    // The committed command now produces this cache version.
+    pending.publish();
+    ++rounds;
+    active_tuning["prediction_cache_deferred"] = 1;
+    active_tuning["prediction_cache_consumed"] = consumed_prediction;
+    active_tuning["async_rounds"] = async_depth;
+    active_tuning["round_buffers"] = round_buffers;
+    active_tuning["commit_early"] = commit_early;
+    // Same tree range and floating-point additions as the forest recipe
+    // below, reading the emitted single-tree table instead. Unused inputs
+    // (base scores, categories, tree and leaf weights) bind a valid buffer.
+    PredictParams pp{data.rows, data.cols, groups, 1, rounds - 1, rounds, objective(), 1, 1, groups, 0, 0};
+    auto input = data.partition_data();
+    auto bounds = data.partition_category_bounds();
+    pp.bin_partition = static_cast<u32>(static_cast<bool>(bounds));
+    auto const& unused = async_tree.meta;
+    prediction_cache(data).deferred = DeferredPrediction{{input, async_tree.nodes, async_tree.meta, unused, prediction,
+                                                          unused, unused, unused, bounds ? bounds : unused},
+                                                         next_prediction, pp, rounds};
+    async_tuning_round_ = async_tree.round;
+    // Retire completed rounds in order, then bound the rounds in flight.
+    while (!inflight_.empty() && (inflight_.size() > async_depth || inflight_.front().command->completed()))
+      retire_round();
+    return;
+  }
+  // Retirement of committed asynchronous rounds may precede this round's
+  // trees; they occupy earlier rounds, so scan the same-round suffix now.
+  auto first_new_tree = trees.size();
+  while (first_new_tree && trees[first_new_tree - 1].round == rounds) --first_new_tree;
   normalize_trees(static_cast<std::size_t>(tree_groups) * parallel);
   ++rounds;
   // TreeBuilder replaces the tuning map. Publish these per-update selections
   // after tree construction so its workspace/profile reset cannot erase them.
   active_tuning["prediction_cache_deferred"] = 0;
   active_tuning["prediction_cache_consumed"] = consumed_prediction;
+  active_tuning["async_rounds"] = 0;
+  active_tuning["round_buffers"] = round_buffers;
+  active_tuning["commit_early"] = commit_early;
   upload_model();
   if (tree_weights_.empty()) {
-    Buffer next_prediction(static_cast<std::size_t>(data.rows) * groups * sizeof(float));
+    Buffer next_prediction = round_buffers ? pooled_buffer(margin_pool_, margin_bytes) : Buffer(margin_bytes);
     PredictParams pp{data.rows, data.cols, groups, static_cast<u32>(trees.size()), rounds - 1, rounds, objective(), 1, 1, groups, 0, 0};
     pp.tree_begin = static_cast<u32>(first_new_tree);
     auto input = is_tree_update() || has_refresh() ? data.data : data.partition_data();
@@ -737,6 +861,7 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   }
 }
 void Learner::reset(bool clear_dropout) {
+  drain();
   if (clear_dropout) {
     dropped_trees_.clear();
     trees_to_update_.clear(); update_original_weights_ = false;
@@ -747,7 +872,8 @@ void Learner::reset(bool clear_dropout) {
     ranking_objective_cache_.reset(); ranking_metric_caches_.clear();
     ranking_bias_work_initialized_ = false;
   }
-  tree_workspace_.clear();
+  tree_workspace_.clear(); tree_workspace_inputs_.clear();
+  round_buffers_ = {}; margin_pool_.clear(); round_output_pool_.clear();
   refresh_workspace_.clear();
   sampling_workspace_.clear();
   refresh_source_ = {}; refresh_matrix_.reset();
@@ -774,6 +900,8 @@ std::string Learner::default_metric() const {
 }
 std::string Learner::evaluate(int iteration, std::span<std::shared_ptr<Matrix> const> datasets,
                               std::span<std::string const> names) {
+  // Evaluation without data neither reads the model nor waits for rounds.
+  if (!datasets.empty()) drain();
   configure();
   require(initialized, "Model is not yet initialized (not fitted).");
   if (metrics.empty() && !integer("disable_default_eval_metric", 0)) {

@@ -457,7 +457,7 @@ int XGBoosterEvalOneIter(BoosterHandle h, int iteration, DMatrixHandle data[], c
   return booster_api(h, [&](Learner& b) { std::vector<MatrixHandle> matrices; std::vector<std::string> labels; for (bst_ulong i = 0; i < len; ++i) { matrices.push_back(matrix(data[i])); labels.emplace_back(names[i]); } result.text = b.evaluate(iteration, matrices, labels); *out = result.text.c_str(); });
 }
 int XGBoosterGetNumFeature(BoosterHandle h, bst_ulong* out) { return booster_api(h, [&](Learner& b) { b.configure(); *out = b.num_feature; }); }
-int XGBoosterBoostedRounds(BoosterHandle h, int* out) { return booster_api(h, [&](Learner& b) { b.configure(); *out = b.rounds; }); }
+int XGBoosterBoostedRounds(BoosterHandle h, int* out) { return booster_api(h, [&](Learner& b) { b.drain(); b.configure(); *out = b.rounds; }); }
 int XGBoosterSlice(BoosterHandle h, int begin, int end, int step, BoosterHandle* out) {
   int status = booster_api(h, [&](Learner& b) { *out = b.slice(begin, end, step).release(); });
   return status && last_error.find("out of range") != std::string::npos ? -2 : status;
@@ -528,6 +528,7 @@ int XGBoosterDumpModelExWithFeatures(BoosterHandle h, int n, char const** names,
 int XGBoosterDumpModelWithFeatures(BoosterHandle h, int n, char const** names, char const** types, int stats, bst_ulong* len, char const*** out) { return XGBoosterDumpModelExWithFeatures(h, n, names, types, stats, "text", len, out); }
 int XGBoosterFeatureScore(BoosterHandle h, char const* config, bst_ulong* nfeatures, char const*** names, bst_ulong* ndim, bst_ulong const** shape, float const** scores) {
   return booster_api(h, [&](Learner& b) {
+    b.drain();
     b.configure();
     auto c = parse_json(config); auto kind = c.value("importance_type", "weight");
     if (b.is_linear()) {
@@ -573,12 +574,28 @@ int XGTrackerFree(TrackerHandle) { return 0; }
 // Optional profiling extension. Existing XGBoost entry points stay unchanged.
 extern "C" __attribute__((visibility("default"))) int XGBoosterMetalProfile(BoosterHandle h, char const** out) {
   return booster_api(h, [&](Learner& b) {
+    // Timings and latest-tree fields describe retired rounds.
+    b.drain();
     auto const& f = b.forest_uploads;
     result.text = Json{{"gpu_seconds", b.gpu_seconds}, {"command_buffers", b.command_count},
       {"tuning", b.active_tuning}, {"device", parse_json(Runtime::get().info())["METAL_DEVICE"]},
       {"forest_uploads", {{"full_uploads", f.full_uploads}, {"append_uploads", f.append_uploads},
         {"trees_uploaded", f.trees_uploaded}, {"bytes_uploaded", f.bytes_uploaded},
-        {"buffer_allocations", f.buffer_allocations}, {"bytes_relocated", f.bytes_relocated}}}}.dump();
+        {"buffer_allocations", f.buffer_allocations}, {"bytes_relocated", f.bytes_relocated}}},
+      {"split_screening", {{"candidates", b.split_screening.candidates},
+        {"certified", b.split_screening.certified}, {"uncertain", b.split_screening.uncertain},
+        {"exact", b.split_screening.exact}, {"groups", b.split_screening.groups},
+        {"exact_groups", b.split_screening.exact_groups}}}}.dump();
     *out = result.text.c_str();
+  });
+}
+// Optional validation extension: compares GPU leaf scaling for asynchronous
+// rounds with the host multiply over binary32 bit patterns [begin, begin + count).
+extern "C" __attribute__((visibility("default"))) int XGBMetalValidateLeafScaling(
+    float eta, std::uint64_t begin, std::uint64_t count, std::uint64_t* mismatches, std::uint32_t* first_mismatch) {
+  return api([&] {
+    require(mismatches && first_mismatch, "Null validation output.");
+    *first_mismatch = 0;
+    *mismatches = validate_leaf_scaling(eta, begin, count, first_mismatch);
   });
 }

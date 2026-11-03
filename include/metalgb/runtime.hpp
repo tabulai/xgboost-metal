@@ -26,6 +26,9 @@ class Buffer {
   bool reserve(std::size_t bytes, std::size_t preserve_bytes);
   template <class T> [[nodiscard]] T* as() const { return static_cast<T*>(data()); }
   explicit operator bool() const { return static_cast<bool>(object_); }
+  // Host references to the allocation, including prefixes. Committed Metal
+  // commands retain the native buffer separately and are not counted.
+  [[nodiscard]] long use_count() const { return object_.use_count(); }
   void zero() const { if (bytes_) std::memset(data(), 0, bytes_); }
  private:
   std::shared_ptr<void> object_;
@@ -73,11 +76,27 @@ class Command {
   }
   void zero(Buffer const& buffer);
   void set_coalescing(bool enabled);
+  // Submit the work encoded so far and continue in a new command buffer on
+  // the same queue. Queue order and tracked buffers keep the dispatch order.
+  void flush();
+  // Submit without waiting. Encoding is no longer allowed; wait() still
+  // reports completion, errors and GPU time for every submitted buffer.
+  void commit();
+  [[nodiscard]] bool completed() const;
+  // Waits for the last command buffer and checks all of them. The result is
+  // the sum of their GPU intervals, excluding idle time between them.
   double wait();
   [[nodiscard]] std::size_t encoder_count() const { return encoder_count_; }
  private:
-  void* begin_compute();
+  void* begin_compute(std::string_view kernel);
   void end_compute();
+  void submit_current();
+  // Optional per-dispatch timestamps (METALGB_DISPATCH_PROFILE=<path>).
+  struct Profile;
+  std::unique_ptr<Profile> profile_;
+  std::vector<void*> flushed_;
+  std::string label_;
+  bool started_{false};
   void* object_{nullptr};
   void* encoder_{nullptr};
   std::size_t encoder_count_{0};

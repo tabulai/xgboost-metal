@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <map>
 #include <memory>
@@ -105,6 +106,9 @@ struct Matrix : std::enable_shared_from_this<Matrix> {
   [[nodiscard]] Buffer export_data() const;
   [[nodiscard]] Buffer partition_data() const;
   [[nodiscard]] Buffer partition_category_bounds() const;
+  // Lazily derived uint8 histogram codes interleaved by feature group; empty
+  // when a code does not fit. The canonical uint16 bins remain authoritative.
+  [[nodiscard]] Buffer packed_bins(u32 chunk) const;
   void make_quantile_cuts(MatrixParams const& params);
   void export_cuts();
   [[nodiscard]] std::shared_ptr<Matrix> slice(std::span<int const> indices, bool allow_groups) const;
@@ -113,6 +117,8 @@ struct Matrix : std::enable_shared_from_this<Matrix> {
   void decode_quantiles(Buffer const& output, bool representative, bool numeric_only = false) const;
   bool cuts_categorical_{false}, quantized_types_changed_{false};
   mutable Buffer partition_data_, partition_bounds_;
+  mutable Buffer packed_bins_;
+  mutable u32 packed_chunk_{0};
   mutable std::mutex recode_mutex_;
   mutable Json recoded_categories_;
   mutable Buffer recoded_data_;
@@ -128,6 +134,22 @@ struct Tree {
   std::vector<float> leaf_weights;
 };
 struct Prediction { Buffer values; std::vector<std::uint64_t> shape; };
+// GPU outputs of a committed GPU-driven tree whose host replay is deferred
+// (metal_async_rounds). The emitted Node table feeds the next round's margin
+// update; the replay of state/flags/history remains the model's only source.
+struct GpuTreeRound {
+  Buffer state, flags, history, nodes, meta;
+  float eta{0};
+  u32 group{0}, round{0}, node_capacity{0};
+  bool record_paths{true};
+  explicit operator bool() const { return static_cast<bool>(state); }
+};
+// Host assembly of a completed GPU-driven tree, shared by both round modes.
+Tree replay_gpu_tree(GpuTreeRound const& round, u32& evaluated_levels);
+// Compares GPU leaf scaling with the host multiply for consecutive binary32
+// bit patterns; returns the mismatch count (validation extension).
+std::uint64_t validate_leaf_scaling(float eta, std::uint64_t begin, std::uint64_t count,
+                                    std::uint32_t* first_mismatch);
 
 class Learner {
  public:
@@ -150,8 +172,13 @@ class Learner {
     std::uint64_t full_uploads{}, append_uploads{}, trees_uploaded{}, bytes_uploaded{};
     std::uint64_t buffer_allocations{}, bytes_relocated{};
   } forest_uploads;
+  // Cumulative screened-kernel candidate counts (metal_split_screening_stats).
+  struct SplitScreeningStats {
+    std::uint64_t candidates{}, certified{}, uncertain{}, exact{}, groups{}, exact_groups{};
+  } split_screening;
 
   Learner();
+  ~Learner();
   void prepare_objective(std::string_view name);
   void set_param(std::string key, std::string value);
   void clear_linear_parameters();
@@ -180,11 +207,40 @@ class Learner {
   [[nodiscard]] std::unique_ptr<Learner> slice(int begin, int end, int step);
   void reset(bool clear_dropout = true);
   void record(std::string const& label, double elapsed) { gpu_seconds[label] += elapsed; ++command_count; }
+  // Asynchronous boosting rounds (metal_async_rounds). drain() retires every
+  // committed round in order; a failed round rolls the model back to the
+  // last good round and its error is rethrown here.
+  void drain();
+  [[nodiscard]] bool has_inflight_rounds() const { return !inflight_.empty(); }
+  // Reusable buffer for an asynchronous round's GPU outputs.
+  Buffer round_output(std::size_t bytes);
  private:
   std::vector<Tree> trees_to_update_;
   bool update_original_weights_{false};
   std::vector<std::string> tree_updaters_{"grow_metal_hist"};
   std::vector<Buffer> tree_workspace_;
+  std::vector<std::vector<std::uint8_t>> tree_workspace_inputs_;
+  // Persistent per-round scratch (metal_round_buffers). Pooled buffers are
+  // reused only when no host reference remains, so a margin buffer returned
+  // to a caller is never rewritten.
+  struct RoundBuffers {
+    Buffer gradient, partial, scale, quantized, value_partial, value_scale, value_quantized;
+  } round_buffers_;
+  std::vector<Buffer> margin_pool_, round_output_pool_;
+  Buffer pooled_buffer(std::vector<Buffer>& pool, std::size_t bytes);
+  // A committed round. Its GPU outputs stay referenced until retirement, so
+  // the output pool cannot hand them out while the host may still read them.
+  // Margin buffers are written only by GPU commands, which the single queue
+  // orders, and are read by the host only after drain().
+  struct InFlightRound {
+    std::unique_ptr<Command> command;
+    GpuTreeRound tree;
+  };
+  std::deque<InFlightRound> inflight_;
+  u32 async_tuning_round_{UINT32_MAX};
+  void retire_round();
+  void abandon_rounds() noexcept;
+  std::map<std::string, std::string, std::less<>> validated_params_;
   std::map<std::string, Buffer, std::less<>> refresh_workspace_;
   Buffer refresh_source_;
   std::weak_ptr<Matrix const> refresh_matrix_;
@@ -315,7 +371,8 @@ class Learner {
   double survival_metric(Matrix const& data, Buffer const& prediction, u32 type);
   double metric(Matrix const& data, Buffer const& prediction, std::string const& name);
   Tree grow(Matrix& data, Buffer const& gradients, Buffer const& scales, u32 group, float eta,
-            bool compact = false, u32 targets = 1, u32 outputs = 1, Command* root_command = nullptr);
+            bool compact = false, u32 targets = 1, u32 outputs = 1, Command* root_command = nullptr,
+            GpuTreeRound* async_round = nullptr);
   void update_vector_leaves(Tree& tree, Matrix const& data, Buffer const& gradient, Buffer const& scales, float eta);
 };
 }  // namespace metalgb

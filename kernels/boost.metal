@@ -433,10 +433,23 @@ kernel void plan_histograms(device const uint* counts [[buffer(0)]],
   uint tiles = count / p.rows_per_tile + uint(count % p.rows_per_tile != 0);
   uint groups = (p.cols - 1) / p.features + 1;
   uint cursor = atomic_fetch_add_explicit(arguments, tiles * groups, memory_order_relaxed);
+  // Only GPU-tree histogram variants set these flags; they decode tagged nodes
+  // and derive the feature group of a row-tile record from the threadgroup.
+  uint tag = (p.padding & kHistogramPlanSingleOwner) && tiles == 1 ? kHistogramSingleOwnerTag : 0u;
+  if (p.padding & kHistogramPlanTiles) {
+    // Every reservation is a multiple of groups, so it also names a tile slot.
+    cursor /= groups;
+    for (uint tile = 0; tile < tiles; ++tile) {
+      uint row = tile * p.rows_per_tile;
+      uint begin = offsets[node] + row, end = begin + min(p.rows_per_tile, count - row);
+      tasks[cursor++] = HistTask{begin, end, node | tag, 0};
+    }
+    return;
+  }
   for (uint f = 0; f < groups; ++f) for (uint tile = 0; tile < tiles; ++tile) {
     uint row = tile * p.rows_per_tile;
     uint begin = offsets[node] + row, end = begin + min(p.rows_per_tile, count - row);
-    tasks[cursor++] = HistTask{begin, end, node, f * p.features};
+    tasks[cursor++] = HistTask{begin, end, node | tag, f * p.features};
   }
 }
 
@@ -518,6 +531,7 @@ kernel void histogram_grouped(device const ushort* bins [[buffer(0)]],
 #include "histogram_missing.metal.h"
 #include "histogram_present.metal.h"
 #include "histogram_compact.metal.h"
+#include "histogram_tiled.metal.h"
 
 kernel void subtract_histograms(device const uint* parent [[buffer(0)]],
                                 device const HistSubtract* tasks [[buffer(1)]],
@@ -844,6 +858,7 @@ kernel void evaluate_splits_simd(device const uint* histogram [[buffer(0)]], dev
 #include "scalar_parallel.metal.h"
 #include "scalar_compact.metal.h"
 #include "scalar_root_parallel.metal.h"
+#include "scalar_screen.metal.h"
 
 // Split long numeric features across SIMD groups. Integer carries and the
 // original forward/backward candidate positions preserve the scalar tie order.
@@ -1005,6 +1020,55 @@ kernel void select_splits(device const Split* candidates [[buffer(0)]],
   best[node] = result;
 }
 
+// One 32-thread threadgroup selects each node. Every lane scans its features
+// in increasing order and keeps the earliest gain that no later one exceeds;
+// the SIMD maximum and then the smallest matching feature reproduce the serial
+// first-strictly-greater chain above (+0 and -0 compare equal in both). NaN
+// gains are never chosen, and a NaN first candidate keeps feature zero, as no
+// comparison against it succeeds. Lane zero then applies the unchanged split
+// and parent-statistic arithmetic to the same candidate bytes. Deferred
+// selection leaves the applied statistics to tree_driver_applied_statistics:
+// only the host replay and asynchronous node emission read them.
+template <bool Applied>
+inline void select_split_group(device const Split* candidates, device Split* best,
+                               device const float2* scales, device const float2* bounds,
+                               constant SplitParams& p, uint node, uint lane) {
+  if (node >= p.nodes) return;
+  device const Split* row = candidates + ulong(node) * p.cols;
+  float gain = -INFINITY;
+  uint feature = 0xffffffffu;
+  for (uint f = lane; f < p.cols; f += 32) {
+    float other = row[f].gain;
+    if (other > gain || (other == gain && f < feature)) { gain = other; feature = f; }
+  }
+  float maximum = simd_max(gain);
+  uint chosen = simd_min(gain == maximum ? feature : 0xffffffffu);
+  if (lane) return;
+  // The serial scan also reads candidate zero when there are no features.
+  if (chosen == 0xffffffffu || isnan(row[0].gain)) chosen = 0;
+  Split result = row[chosen];
+  if (Applied && result.feature >= 0) {
+    auto sums = split_parent_sums(long2(result.left_sum.g, result.left_sum.h),
+                                  long2(result.right_sum.g, result.right_sum.h), scales[p.group]);
+    result.applied_parent_weight = split_parent_weight(sums, p.reg_alpha, p.reg_lambda,
+                                                       p.max_delta_step, bounds[node]);
+    result.applied_parent_hessian = cox_float_result(sums.y);
+  }
+  best[node] = result;
+}
+#define SELECT_SPLIT_ARGUMENTS \
+    device const Split* candidates [[buffer(0)]], device Split* best [[buffer(1)]], \
+    device const float2* scales [[buffer(2)]], device const float2* bounds [[buffer(3)]], \
+    constant SplitParams& p [[buffer(4)]], uint node [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_threadgroup]]
+kernel void select_splits_simd(SELECT_SPLIT_ARGUMENTS) {
+  select_split_group<true>(candidates, best, scales, bounds, p, node, lane);
+}
+kernel void select_splits_simd_deferred(SELECT_SPLIT_ARGUMENTS) {
+  select_split_group<false>(candidates, best, scales, bounds, p, node, lane);
+}
+#undef SELECT_SPLIT_ARGUMENTS
+
 inline bool category_member(device const uint* categories, uint begin, uint count, float value) {
   if (fp32_less(value, 0) || value >= 16777216.0f) return false;
   uint category = uint(value), lo = 0, hi = count;
@@ -1045,6 +1109,199 @@ kernel void plan_partitions(device const uint* counts [[buffer(0)]],
     tasks[first + tile] = PartitionTask{begin, end, node, segment};
   }
 }
+// GPU-driver planners. Each parent still reserves one contiguous task range,
+// so segments and tasks are the records plan_partitions writes. With Cursors,
+// the planner also zeroes both children's counts: the two-ended partition
+// accumulates them atomically as its left and right cursors.
+#define PLAN_PARTITION_ARGUMENTS \
+    device const uint* counts [[buffer(0)]], device const uint* offsets [[buffer(1)]], \
+    device const int2* children [[buffer(2)]], device PartitionTask* tasks [[buffer(3)]], \
+    device PartitionSegment* segments [[buffer(4)]], device atomic_uint* arguments [[buffer(5)]], \
+    device uint* child_counts [[buffer(6)]], constant uint& parents [[buffer(7)]]
+// One thread per parent, as in plan_partitions.
+kernel void plan_partitions_cursors(PLAN_PARTITION_ARGUMENTS, uint node [[thread_position_in_grid]]) {
+  if (node >= parents || children[node].x < 0) return;
+  int2 child = children[node];
+  uint count = counts[node], begin = offsets[node], tiles = count / 256 + uint(count % 256 != 0);
+  uint first = atomic_fetch_add_explicit(arguments, tiles, memory_order_relaxed);
+  uint segment = uint(child.x) / 2;
+  segments[segment] = PartitionSegment{begin, begin + count, first, first + tiles, uint(child.x), uint(child.y)};
+  child_counts[child.x] = 0;
+  child_counts[child.y] = 0;
+  for (uint tile = 0; tile < tiles; ++tile) {
+    uint row = tile * 256;
+    tasks[first + tile] = PartitionTask{begin + row, begin + row + min(256u, count - row), node, segment};
+  }
+}
+// One threadgroup per parent writes its tiles in parallel. Serially, the
+// depth-one root segment would write every 256-row tile from one thread.
+//
+// With Bins, it also finds the cut index k whose value equals the parent's
+// numeric threshold. quantize stores bin = min(#{j : value >= cut_j}, n - 1)
+// for sorted cuts, so value < cut_k exactly when that count is at most k, and
+// for k < n - 1 exactly when bin <= k (fp32 comparisons are complementary for
+// non-NaN values, with the same signed-zero and subnormal order). The last
+// cut (clamped bin), a minimum threshold, unsorted cuts or a categorical
+// split store all ones and keep the float comparison.
+template <bool Cursors, bool Bins>
+inline void plan_partitions_group(device const uint* counts, device const uint* offsets,
+                                  device const int2* children, device PartitionTask* tasks,
+                                  device PartitionSegment* segments, device atomic_uint* arguments,
+                                  device uint* child_counts, uint parents, uint node, uint tid,
+                                  uint threads, threadgroup uint* reserved,
+                                  device const Split* splits = nullptr, device const float* cuts = nullptr,
+                                  device const uint* cut_counts = nullptr, uint stride = 0,
+                                  device uint* bin_splits = nullptr,
+                                  threadgroup atomic_uint* search = nullptr) {
+  if (node >= parents || children[node].x < 0) return;
+  int2 child = children[node];
+  uint count = counts[node], begin = offsets[node], tiles = count / 256 + uint(count % 256 != 0);
+  uint segment = uint(child.x) / 2;
+  if (!tid) {
+    uint first = atomic_fetch_add_explicit(arguments, tiles, memory_order_relaxed);
+    reserved[0] = first;
+    segments[segment] = PartitionSegment{begin, begin + count, first, first + tiles,
+                                        uint(child.x), uint(child.y)};
+    if (Cursors) { child_counts[child.x] = 0; child_counts[child.y] = 0; }
+    if (Bins) {
+      atomic_store_explicit(search, 0xffffffffu, memory_order_relaxed);
+      atomic_store_explicit(search + 1, 0, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint first = reserved[0];
+  for (uint tile = tid; tile < tiles; tile += threads) {
+    uint row = tile * 256;
+    tasks[first + tile] = PartitionTask{begin + row, begin + row + min(256u, count - row), node, segment};
+  }
+  if (!Bins) return;
+  Split split = splits[node];
+  bool numeric = split.feature >= 0 && !split.split_type;
+  uint feature = numeric ? uint(split.feature) : 0, bins = numeric ? cut_counts[feature] : 0;
+  auto column = cuts + ulong(feature) * stride;
+  for (uint j = tid; j < bins; j += threads) {
+    float cut = column[j];
+    if (fp32_equal(cut, split.threshold)) atomic_fetch_min_explicit(search, j, memory_order_relaxed);
+    if (j + 1 < bins && !fp32_less_equal(cut, column[j + 1]))
+      atomic_store_explicit(search + 1, 1, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid) return;
+  uint k = atomic_load_explicit(search, memory_order_relaxed);
+  bool sorted = !atomic_load_explicit(search + 1, memory_order_relaxed);
+  bin_splits[node] = numeric && sorted && k != 0xffffffffu && k + 1 < bins ? k : 0xffffffffu;
+}
+kernel void plan_partitions_parallel(PLAN_PARTITION_ARGUMENTS,
+                                     uint node [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint threads [[threads_per_threadgroup]]) {
+  threadgroup uint reserved[1];
+  plan_partitions_group<false, false>(counts, offsets, children, tasks, segments, arguments, child_counts,
+                                      parents, node, tid, threads, reserved);
+}
+kernel void plan_partitions_parallel_cursors(PLAN_PARTITION_ARGUMENTS,
+                                             uint node [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint threads [[threads_per_threadgroup]]) {
+  threadgroup uint reserved[1];
+  plan_partitions_group<true, false>(counts, offsets, children, tasks, segments, arguments, child_counts,
+                                     parents, node, tid, threads, reserved);
+}
+kernel void plan_partitions_parallel_bins(PLAN_PARTITION_ARGUMENTS,
+                                          device const Split* splits [[buffer(8)]],
+                                          device const float* cuts [[buffer(9)]],
+                                          device const uint* cut_counts [[buffer(10)]],
+                                          device uint* bin_splits [[buffer(11)]],
+                                          constant SplitParams& p [[buffer(12)]],
+                                          uint node [[threadgroup_position_in_grid]],
+                                          uint tid [[thread_index_in_threadgroup]],
+                                          uint threads [[threads_per_threadgroup]]) {
+  threadgroup uint reserved[1];
+  threadgroup atomic_uint search[2];
+  plan_partitions_group<true, true>(counts, offsets, children, tasks, segments, arguments, child_counts,
+                                    parents, node, tid, threads, reserved, splits, cuts, cut_counts,
+                                    p.bins, bin_splits, search);
+}
+#undef PLAN_PARTITION_ARGUMENTS
+
+// Single-pass partition for the GPU driver. Each 256-row tile reserves one
+// run at the front (left rows) and one at the back (right rows) of its parent
+// segment with a relaxed atomic per side, then writes each run in ascending
+// row-position order. The final cursors are the children's row counts, from
+// which partition_atomic_offsets derives their offsets. Only row order inside
+// a child depends on tile arrival; its row set is the stable partition's.
+// Every consumer is order independent: histograms add exact modulo-2^64
+// integers, planners use counts, and the next partition is set based.
+// With Bins, a parent whose planner found an equal cut compares the
+// feature-major bin of the same data instead of gathering row-major floats.
+template <bool Bins>
+inline void partition_two_ended_tile(device const float* data, device const uint* rows,
+                                     device const Split* splits, device const PartitionTask* tasks,
+                                     device const PartitionSegment* segments, device atomic_uint* cursors,
+                                     device uint* output, device const uint* categories,
+                                     constant PartitionParams& p, uint block, uint tid,
+                                     threadgroup uint* sums, threadgroup uint* bases,
+                                     device const ushort* bins = nullptr,
+                                     device const uint* bin_splits = nullptr) {
+  PartitionTask task = tasks[block];
+  uint index = task.begin + tid, row = 0;
+  bool valid = index < task.end, left = false;
+  if (valid) {
+    Split split = splits[task.node];
+    row = rows[index];
+    uint bin_split = Bins ? bin_splits[task.node] : 0xffffffffu;
+    if (Bins && bin_split != 0xffffffffu) {
+      uint bin = load_bin(bins, ulong(split.feature) * p.rows + row, 0);
+      left = bin == 0xffffffffu ? bool(split.default_left) : bin <= bin_split;
+    } else {
+      float value = data[ulong(row) * p.cols + uint(split.feature)];
+      left = split_left(value, split.threshold, split.default_left, split.split_type,
+                        split.category_begin, split.category_count, categories);
+    }
+  }
+  uint prefix = simd_prefix_exclusive_sum(uint(left));
+  uint sum = simd_sum(uint(left));
+  if ((tid & 31) == 0) sums[tid / 32] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint total = 0;
+  for (uint i = 0; i < 8; ++i) {
+    if (i < tid / 32) prefix += sums[i];
+    total += sums[i];
+  }
+  PartitionSegment segment = segments[task.segment];
+  uint right = task.end - task.begin - total;
+  if (tid == 0) {
+    bases[0] = total ? atomic_fetch_add_explicit(cursors + segment.left, total, memory_order_relaxed) : 0;
+    bases[1] = right ? atomic_fetch_add_explicit(cursors + segment.right, right, memory_order_relaxed) : 0;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!valid) return;
+  output[left ? segment.begin + bases[0] + prefix
+              : segment.end - bases[1] - right + (tid - prefix)] = row;
+}
+#define PARTITION_TWO_ENDED_ARGUMENTS \
+    device const float* data [[buffer(0)]], device const uint* rows [[buffer(1)]], \
+    device const Split* splits [[buffer(2)]], device const PartitionTask* tasks [[buffer(3)]], \
+    device const PartitionSegment* segments [[buffer(4)]], device atomic_uint* cursors [[buffer(5)]], \
+    device uint* output [[buffer(6)]], device const uint* categories [[buffer(7)]], \
+    constant PartitionParams& p [[buffer(8)]]
+kernel void partition_two_ended(PARTITION_TWO_ENDED_ARGUMENTS,
+                                uint block [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint sums[8], bases[2];
+  partition_two_ended_tile<false>(data, rows, splits, tasks, segments, cursors, output, categories,
+                                  p, block, tid, sums, bases);
+}
+kernel void partition_two_ended_bins(PARTITION_TWO_ENDED_ARGUMENTS,
+                                     device const ushort* bins [[buffer(9)]],
+                                     device const uint* bin_splits [[buffer(10)]],
+                                     uint block [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup uint sums[8], bases[2];
+  partition_two_ended_tile<true>(data, rows, splits, tasks, segments, cursors, output, categories,
+                                 p, block, tid, sums, bases, bins, bin_splits);
+}
+#undef PARTITION_TWO_ENDED_ARGUMENTS
 
 kernel void partition_segment_flags(device const float* data [[buffer(0)]],
                                     device const uint* rows [[buffer(1)]],
@@ -1191,6 +1448,8 @@ kernel void partition_segment_copy(device const uint* source [[buffer(0)]],
 
 #include "tree_driver.metal.h"
 #include "tree_driver_fused.metal.h"
+#include "tree_driver_parallel.metal.h"
+#include "tree_emit.metal.h"
 
 struct DenseRow {
   device const float* values;

@@ -38,6 +38,7 @@ struct ShapLeaf { u32 begin, count, group, round; float value, expectation; u32 
 struct MatrixParams { u32 rows, cols, stride, bins, numeric_bins; };
 struct CategoryRecodeParams { u32 rows, cols, construction, column_major; };
 struct QuantileValueParams { u32 rows, cols, bins, representative, numeric_only; };
+struct PackBinsParams { u32 rows, cols, bins, chunk; };
 struct NormalizeParams { u32 rows, cols; float missing; u32 block_stride; };
 struct SortParams { u32 rows, cols, stride, width; };
 struct SketchStats { u32 nonmissing, elements, runs, summary; };
@@ -95,12 +96,26 @@ struct HistTask { u32 begin, end, node, feature; };
 struct HistSubtract { u32 parent, built, other, padding; };
 struct HistParams { u32 rows, cols, bins, groups, group, tasks, padding0, padding1; };
 struct HistogramPlanParams { u32 nodes, cols, features, rows_per_tile, subtract, padding; };
+// GPU-tree histogram dataflow flags. HistParams.tasks is otherwise unused by
+// histogram kernels: its low bits select row-tile records and their decode
+// order, and its high half holds the packed-bin words per row chunk.
+// HistogramPlanParams.padding selects tile records and single-owner tags.
+// A tagged HistTask.node is the only task building that histogram slice.
+enum : u32 {
+  kHistogramTileRecords = 1, kHistogramTileMajor = 2, kHistogramPackedShift = 16,
+  kHistogramPlanTiles = 1, kHistogramPlanSingleOwner = 2,
+  kHistogramSingleOwnerTag = 0x80000000u
+};
 struct SplitParams {
   u32 nodes, cols, bins, group;
   float reg_lambda, reg_alpha, min_child_weight, max_delta_step;
   u32 max_cat_to_onehot, max_cat_threshold, sort_stride, has_categorical;
   u32 use_parent_sums{0}, padding0{0}, padding1{0}, padding2{0};
 };
+// Certified split screening: cut_offset selects this level's node-cutoff
+// cells, node_cut enables them, statistics enables candidate counters and
+// inherit takes nonroot parent statistics from the parent's selected split.
+struct ScreenParams { u32 cut_offset{0}, node_cut{0}, statistics{0}, inherit{0}; };
 struct Split {
   // Applied scalar statistics are filled only after the winning feature is
   // selected. parent_weight/total_h retain the original node statistics.
@@ -131,11 +146,21 @@ struct TreeDriverParams {
   PartitionParams partition;
   u32 max_depth, node_capacity, parallel_splits, histogram_entries;
   float min_gain;
-  u32 padding0, padding1, padding2;
+  u32 control_flags, padding1, padding2;
 };
 struct TreeDriverDispatch { u32 x, y, z; };
 enum : u32 { kTreeDriverEvaluated = 1, kTreeDriverExpanded = 2 };
 enum : u32 { kTreeDriverCapacityError = 1, kTreeDriverNodeError = 2 };
+// control_flags select the grid shape that prepare writes for parallel
+// control kernels: one SIMD group per selected node, one threadgroup per
+// partition parent. kTreeDriverDenseRoot marks a root whose applied
+// statistics come from select_dense_root_split, not deferred selection.
+// Parallel expansion handles at most kTreeDriverSlots.
+enum : u32 { kTreeDriverParallelSelect = 1, kTreeDriverParallelPlan = 2, kTreeDriverDenseRoot = 4 };
+enum : u32 { kTreeDriverSlots = 512 };
+// Node-table emission for asynchronous GPU-driven rounds.
+struct TreeEmitParams { float eta; u32 group, round, node_capacity; };
+struct TreeEmitSweepParams { u32 begin, count; float eta; u32 padding; };
 struct RefreshParams {
   u32 rows, cols, groups, group;
   u32 count, nodes, begin, depth;
@@ -164,6 +189,7 @@ static_assert(sizeof(PredictParams) == 52);
 static_assert(sizeof(IntPair) == 16);
 static_assert(sizeof(SplitParams) == 64);
 static_assert(sizeof(Split) == 96);
+static_assert(sizeof(ScreenParams) == 16);
 static_assert(sizeof(ScalarTileParams) == 80);
 static_assert(sizeof(ScalarTileChoice) == 112);
 static_assert(sizeof(VectorSplitParams) == 80);
@@ -187,5 +213,7 @@ static_assert(sizeof(SamplingParams) == 48);
 static_assert(sizeof(TreeDriverState) == 16);
 static_assert(sizeof(TreeDriverParams) == 136);
 static_assert(sizeof(TreeDriverDispatch) == 12);
+static_assert(sizeof(TreeEmitParams) == 16);
+static_assert(sizeof(TreeEmitSweepParams) == 16);
 }  // namespace metalgb
 #endif
