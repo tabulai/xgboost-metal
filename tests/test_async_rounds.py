@@ -109,6 +109,15 @@ def test_gpu_leaf_scaling_matches_host_multiply_on_boundary_patterns(eta):
         assert mismatches.value == 0, hex(first.value)
 
 
+@pytest.mark.parametrize("begin,count", [(2**64 - 1, 2), (2**32, 1), (2**32 - 1, 2), (0, 2**32 + 1)])
+def test_leaf_scaling_validation_rejects_out_of_range_sweeps(begin, count):
+    mismatches, first = ctypes.c_uint64(), ctypes.c_uint32()
+    status = xgb.core._LIB.XGBMetalValidateLeafScaling(
+        ctypes.c_float(0.3), ctypes.c_uint64(begin), ctypes.c_uint64(count),
+        ctypes.byref(mismatches), ctypes.byref(first))
+    assert status != 0
+
+
 @pytest.mark.parametrize("consumer", ["predict", "margin", "leaf", "shap", "evaluate", "save", "config",
                                       "dump", "rounds", "score", "slice", "copy", "profile", "attributes",
                                       "empty_evaluate", "feature_names"])

@@ -490,9 +490,13 @@ class TreeBuilder {
     // Unweighted squared error quantizes every row's Hessian to one constant.
     // A per-tree GPU check verifies that before count-based Hessians are used,
     // so caller-supplied gradients reaching this path keep the 16-byte sums.
+    // The check reads every row once per tree, so it pays off only when the
+    // count-based sums replace enough histogram work: at least four feature
+    // groups times levels by default (one group at depth two lost 2-3%).
+    auto unit_work = div_up(data_.cols, features_per_group_) * max_depth_;
     bool unit_hessian = tiled_histograms && data_.rows && learner_.objective() == 0 &&
                         data_.get_info("weight").empty() &&
-                        learner_.integer("metal_histogram_unit_hessian", 1) != 0;
+                        learner_.integer("metal_histogram_unit_hessian", unit_work >= 4) != 0;
     bool tiled = packed_bins || histogram_schedule || single_owner || unit_hessian;
     HistParams histogram_params_value = hp_;
     u32 plan_flags = 0;
@@ -1496,7 +1500,7 @@ Tree replay_gpu_tree(GpuTreeRound const& round, u32& evaluated_levels) {
 }
 
 std::uint64_t validate_leaf_scaling(float eta, std::uint64_t begin, std::uint64_t count, std::uint32_t* first_mismatch) {
-  require(begin + count <= (std::uint64_t{1} << 32) && count <= (std::uint64_t{1} << 32),
+  require(count <= (std::uint64_t{1} << 32) && begin <= (std::uint64_t{1} << 32) - count,
           "Leaf-scaling sweep exceeds the binary32 range.");
   constexpr std::uint64_t chunk = std::uint64_t{1} << 24;
   Buffer output(chunk * sizeof(u32));

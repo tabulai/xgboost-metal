@@ -158,9 +158,12 @@ struct DispatchTotals {
 };
 }
 struct Command::Profile {
-  static constexpr NSUInteger kSamples = 1024;
+  // Metal caps live counter sample buffers per process (32 on M4) and a
+  // buffer at 32 KB (4096 timestamps). Dispatches beyond that are counted
+  // under "<kernel> (untimed)" instead of failing the command.
+  static constexpr NSUInteger kSamples = 4096;
   std::vector<id<MTLCounterSampleBuffer>> buffers;
-  std::vector<std::string> names;
+  std::vector<std::string> names, untimed;
   MTLTimestamp cpu0{0}, gpu0{0};
   ~Profile() { for (auto b : buffers) [b release]; }
   std::pair<id<MTLCounterSampleBuffer>, NSUInteger> next(std::string_view kernel) {
@@ -172,7 +175,7 @@ struct Command::Profile {
       descriptor.sampleCount = kSamples;
       NSError* error = nil;
       auto buffer = [(id<MTLDevice>)Runtime::get().device() newCounterSampleBufferWithDescriptor:descriptor error:&error];
-      if (!buffer) throw std::runtime_error("Cannot allocate timestamp counters: " + error_text(error));
+      if (!buffer) { untimed.emplace_back(kernel); return {nil, 0}; }
       buffers.push_back(buffer);
     }
     names.emplace_back(kernel);
@@ -198,6 +201,7 @@ struct Command::Profile {
           entry.seconds += double(end - begin) * scale;
       }
     }
+    for (auto const& name : untimed) ++totals->kernels[name + " (untimed)"].count;
   }
 };
 namespace {
@@ -231,9 +235,11 @@ void* Command::begin_compute(std::string_view kernel) {
       auto [sample, index] = profile_->next(kernel);
       auto descriptor = [MTLComputePassDescriptor computePassDescriptor];
       descriptor.dispatchType = MTLDispatchTypeSerial;
-      descriptor.sampleBufferAttachments[0].sampleBuffer = sample;
-      descriptor.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
-      descriptor.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1;
+      if (sample) {
+        descriptor.sampleBufferAttachments[0].sampleBuffer = sample;
+        descriptor.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
+        descriptor.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1;
+      }
       encoder = [(id<MTLCommandBuffer>)object_ computeCommandEncoderWithDescriptor:descriptor];
     } else {
       encoder = [(id<MTLCommandBuffer>)object_ computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
@@ -308,9 +314,11 @@ void Command::zero(Buffer const& buffer) {
     if (profile_) {
       auto [sample, index] = profile_->next("fill_buffer");
       auto descriptor = [MTLBlitPassDescriptor blitPassDescriptor];
-      descriptor.sampleBufferAttachments[0].sampleBuffer = sample;
-      descriptor.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
-      descriptor.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1;
+      if (sample) {
+        descriptor.sampleBufferAttachments[0].sampleBuffer = sample;
+        descriptor.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
+        descriptor.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1;
+      }
       encoder = [(id<MTLCommandBuffer>)object_ blitCommandEncoderWithDescriptor:descriptor];
     } else {
       encoder = [(id<MTLCommandBuffer>)object_ blitCommandEncoder];

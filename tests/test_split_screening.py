@@ -64,7 +64,9 @@ def test_root_screening_defaults_to_missing_valued_input(kind, root, driver):
     X, y = inputs(rows=1025, density=0.6)
     if kind == "dense":
         X = np.nan_to_num(X)
-    params = {"metal_gpu_tree": driver, "max_depth": 4}
+    # Host descendants screen only on the fallback scorer, which 64 bins
+    # would not select by default.
+    params = {"metal_gpu_tree": driver, "max_depth": 4, "metal_fallback_parallel_splits": 1}
     if root is not None:
         params["metal_split_screening_root"] = root
     _, stats = compare(X, y, bins=64, rounds=2, params=params)
@@ -198,7 +200,8 @@ def test_empty_frontiers_and_unsplit_roots(case):
                                     {"metal_fallback_parallel_root": 0}])
 def test_host_driver_screens_roots_and_descendants(params):
     X, y = inputs(rows=769, density=0.6)
-    actual, stats = compare(X, y, bins=64, rounds=2, params={"metal_gpu_tree": 0, **params},
+    actual, stats = compare(X, y, bins=64, rounds=2,
+                            params={"metal_gpu_tree": 0, "metal_fallback_parallel_splits": 1, **params},
                             expected_cutoff=0)
     assert all(item["tuning"]["gpu_tree"] == 0 for item in stats)
 
@@ -228,7 +231,9 @@ def test_independent_cpu_reference(reference, params):
     metadata = {"weight": np.linspace(0.1, 1.7, len(y), dtype=np.float32)}
     expected, files = reference(X, y, options, rounds=3, **metadata)
     data = xgb.DMatrix(X, label=y, **metadata)
-    model = xgb.Booster({**options, "metal_split_screening": 1}, [data])
+    # Host descendants screen only on the fallback scorer; 32 bins would not
+    # select it by default.
+    model = xgb.Booster({**options, "metal_split_screening": 1, "metal_fallback_parallel_splits": 1}, [data])
     for iteration in range(3):
         model.update(data, iteration)
         assert profile(model)["tuning"]["split_screening"] == 1
