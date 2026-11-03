@@ -79,7 +79,8 @@ JSON arm file with two entries, for example:
 
 Paths resolve relative to the arm file. Use separate builds, or point both arms
 at one build and set explicit optimization controls in `params`. An optional
-`source_root` records tracked Git source provenance. Then run:
+`source_root` records tracked Git source provenance; untracked files, such as
+an output directory inside the source tree, are not recorded. Then run:
 
 ```sh
 python benchmarks/deep_trees.py --arms-file arms.json \
@@ -215,13 +216,19 @@ does not remove command-buffer waits or histogram allocations. Measure its
 total-fit benefit separately for shallow and deep trees, using an explicit
 zero as the same-binary control.
 
-The default `metal_fallback_parallel_splits=1` path also reuses the
+The `metal_fallback_parallel_splits` path reuses the
 256-thread numeric split kernels for host-driven descendants. It fuses sibling
 histogram subtraction with scoring while preserving the host's inherited sums,
 feature masks, monotone bounds, expansion order, and histogram cache. Selection
 requires numeric scalar input, at most 256 bins, untiled parallel scoring,
 histogram subtraction, `metal_fused_subtraction=1`, `metal_split_threads=256`,
 `metal_fast_gain=1`, and `metal_fast_weight=0`. Root controls remain independent.
+Each threadgroup keeps one lane per bin, so the path wins only when most lanes
+hold a cut. It defaults on when the mean number of cuts per numeric feature
+exceeds 192 for dense input or 160 with missing values; below that, including
+low-cardinality features at the default `max_bin`, the original 32-lane
+evaluator was faster on an M4 Max (up to 1.8x at 64 bins). An explicit value
+overrides this selection.
 
 This path honors `metal_skip_empty_bins` for dense and missing-valued input.
 With skipping enabled, `metal_compact_splits` defaults on for missing-valued
@@ -284,9 +291,10 @@ search, and serial split search retain their existing evaluation. Set
 
 Dense input also uses this optimization on nonroot levels of the fused GPU
 tree path. Deep nodes can have many empty histogram bins even when every input
-value is present. This control leaves root candidate enumeration unchanged;
-dense CPU-driven trees and trees without fused subtraction retain their
-original dense evaluator. Prefix sums and the first candidate in each direction are unchanged,
+value is present. This control leaves root candidate enumeration unchanged.
+Dense CPU-driven trees that select `fallback_parallel_splits` also skip empty
+bins; other dense CPU-driven trees and trees without fused subtraction retain
+their original dense evaluator. Prefix sums and the first candidate in each direction are unchanged,
 so skipping a zero gradient/Hessian pair preserves threshold and tie order.
 
 The GPU driver also supports two independently controlled kernel fusions.
@@ -302,12 +310,15 @@ materializes its own derived histogram slice, synchronizes that group's device
 memory, then performs the existing split search. Built-sibling slices are
 read-only. The complete derived histogram is retained for later levels. This
 removes one dispatch and an inter-dispatch dependency per nonroot level;
-serial split search and CPU-driven trees retain separate subtraction.
+serial split search and CPU-driven trees without `fallback_parallel_splits`
+retain separate subtraction. Setting `metal_fused_subtraction=0` also disables
+that host path.
 
 Set either option to zero for an independent control. Latest-tree tuning fields
 `tree_control_fusion` and `fused_subtraction` report selection of these GPU paths,
 including when pruning leaves later indirect dispatches empty. Both are zero
-when the original CPU tree driver is selected.
+when the CPU tree driver is selected, even when `fallback_parallel_splits` fuses
+host subtraction.
 
 The default `metal_terminal_histogram_elision=1` path omits derived-sibling
 histogram stores and their device barrier at the configured final GPU-tree depth.

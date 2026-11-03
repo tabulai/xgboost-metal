@@ -61,6 +61,8 @@ The separately fixed extension completed **48 fits in 16 processes**, with no fa
 
 Default profiles use 256-thread host descendant scoring; dense compaction remains off and missing compaction is on. Terminal elision is not selected on this host path. These four-cycle intervals are separate from the primary and secondary analyses. All three runs' fit distributions and paired intervals were independently reproduced from their saved receipts. The validated defaults retain explicit opt-outs: `metal_fallback_parallel_splits=0` for host descendants and `metal_terminal_histogram_elision=0` for final GPU histograms. These measurements establish workload-specific gains; they do not establish an application-wide speedup.
 
+A later review measured the host descendant path on fewer cuts, which these 256-level benchmarks never exercised. On 50,000 x 200 normal features at depth 12, it was 1.79x/1.26x/1.12x/1.05x slower at 64/128/160/192 dense cuts and 0.99x/0.93x at 224/256. With 20% missing values it was 1.74x/1.14x/1.05x/1.01x slower at 64/128/144/160 cuts and 0.92x/0.91x/0.78x at 176/192/256; with 1% missing values it was neutral at 160 cuts and 0.91x at 192. At the default `max_bin`, features with 2-128 levels were 1.19-1.50x slower. `metal_fallback_parallel_splits` therefore now defaults on only when the mean numeric cut count exceeds 192 (dense) or 160 (missing values). The 256-level shapes above keep the path, and the depth-8/10 host wins reproduced at 0.80-0.98x on/off.
+
 ## Exploration retained, including losses
 
 | Experiment | Completed fits | Observation and disposition |

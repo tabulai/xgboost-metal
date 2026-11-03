@@ -174,6 +174,16 @@ class TreeBuilder {
       }
       scalar_tiles_ = tile ? std::max(1u, static_cast<u32>(div_up(count, tile))) : 1u;
       scalar_tile_ = scalar_tiles_ > 1 ? tile : 0;
+      // The 256-thread host descendant scorer keeps one lane per bin, so it
+      // overtakes the 32-lane evaluator plus separate subtraction only when
+      // most lanes hold a cut: on an M4 Max, above a mean of about 192 numeric
+      // cuts per feature for dense input and 160 with missing values.
+      auto counts = data.cut_counts.as<u32>();
+      auto categorical = data.categorical.as<std::uint8_t>();
+      std::uint64_t cuts = 0, numeric = 0;
+      for (u32 feature = 0; feature < data.cols; ++feature)
+        if (!categorical[feature]) { cuts += counts[feature]; ++numeric; }
+      fallback_wide_cuts_ = numeric && cuts > numeric * (data.quantized_dense ? 192u : 160u);
     }
     split_skip_empty_bins_ = learner.integer("metal_skip_empty_bins", 1) != 0 &&
                              !data.quantized_dense && !vector_ && parallel_splits_ && scalar_tiles_ == 1;
@@ -776,7 +786,7 @@ class TreeBuilder {
     bool fallback_parallel_splits = !vector_ && targets_ == 1 && !has_categories_ &&
         sp_.use_parent_sums && subtraction_count && n == 2 * subtraction_count &&
         parallel_splits_ && scalar_tiles_ == 1 && data_.histogram_bins <= 256 &&
-        learner_.integer("metal_fallback_parallel_splits", 1) != 0 &&
+        learner_.integer("metal_fallback_parallel_splits", fallback_wide_cuts_) != 0 &&
         learner_.integer("metal_fused_subtraction", 1) != 0 &&
         learner_.integer("metal_split_threads", 256) == 256 &&
         learner_.integer("metal_fast_gain", 1) != 0 &&
@@ -1046,7 +1056,7 @@ class TreeBuilder {
   u32 targets_, max_depth_, max_leaves_, leaves_{1};
   float min_gain_;
   bool vector_, compact_, lossguide_, scan_, fused_, subtract_, coalesce_, compute_fill_, parallel_splits_, fixed_workspace_, histogram_missing_, has_categories_;
-  bool split_skip_empty_bins_{false};
+  bool split_skip_empty_bins_{false}, fallback_wide_cuts_{false};
   u32 rows_per_tile_, features_per_group_;
   u32 scalar_tile_{0}, scalar_tiles_{1};
   std::size_t histogram_words_, cache_limit_, cached_nodes_{0};
