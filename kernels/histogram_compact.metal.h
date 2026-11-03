@@ -142,6 +142,10 @@ kernel void fill_histogram_built(device uint4* histogram [[buffer(0)]],
     uint built = counts[first] <= counts[first + 1] ? first : first + 1;
     if (block.y != built) return;
   }
+  // A single-owner histogram task stores its whole slice, zero bins included.
+  // Zero-row built nodes emit no tasks and are still cleared here.
+  uint count = counts[block.y];
+  if ((plan.padding & kHistogramPlanSingleOwner) && count && count <= plan.rows_per_tile) return;
   ulong offset = (ulong(block.y) * p.cols + block.x) * (p.bins + 1);
   for (uint bin = tid; bin <= p.bins; bin += 256) histogram[offset + bin] = uint4(0);
 }

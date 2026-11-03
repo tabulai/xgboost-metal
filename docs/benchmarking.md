@@ -133,6 +133,11 @@ maximum depth two through six. Earlier prediction/gradient encoders retain
 their boundaries. Other depths, missing-containing inputs and CPU-tree
 fallbacks retain separate encoders. Explicit `metal_coalesce_encoders=0` or `1`
 overrides this selection; one also coalesces the earlier prediction/gradients.
+Independently of this setting, a GPU-driven tree encodes its initialization
+dispatches (row identities, the unit-Hessian flag clear and check, the
+node-cutoff clear and driver initialization) in one serial encoder;
+`coalesced_encoders` reports only the selection above. Per-dispatch profiling
+still gives every dispatch its own encoder.
 
 New deferred updates require an ordinary `DMatrix`, one scalar output, one tree
 per round, gradient/root fusion, and an eligible GPU-driven tree. Squared error,
@@ -145,7 +150,8 @@ GPU-tree eligibility and scratch-budget guards still apply. A previously
 deferred update may be consumed by a subsequent CPU-driven tree's fused root,
 but that tree does not create a new deferred update.
 
-Only an unsubmitted recipe survives an API call; GPU work is complete on return.
+Only an unsubmitted recipe survives an API call; GPU work is complete on return,
+except for the opt-in asynchronous rounds described below.
 Public prediction/evaluation and incompatible updates flush pending recipes.
 Forest upload flushes them before changing shared input buffers. Reset, model
 replacement, expired matrices and cache eviction may discard unused recipes;
@@ -320,6 +326,53 @@ including when pruning leaves later indirect dispatches empty. Both are zero
 when the CPU tree driver is selected, even when `fallback_parallel_splits` fuses
 host subtraction.
 
+Several GPU-driver control kernels replace single-thread loops with parallel
+forms; each has its own switch and same-named latest-tree tuning field.
+`metal_parallel_select=1` selects each node's split with one SIMD group: lanes
+scan features in order, then a SIMD maximum and the smallest matching feature
+reproduce the original first-strictly-greater scan, including its signed-zero
+ties and its handling of NaN gains. `metal_deferred_parent_statistics` leaves
+the applied parent weight and Hessian of selected splits to one pass per
+tree over expanded nodes. Only the CPU replay and asynchronous node emission
+read these values, so the pass runs before emission. It
+applies the unchanged binary64 helpers to the same recorded child sums, so
+each level no longer waits on a serial software division. It defaults on from
+two per-level selections (a dense root keeps its own ordered-sum statistics),
+adds one dispatch per tree, and requires parallel selection.
+`metal_parallel_tree_control=1` applies a frontier in one threadgroup. An
+exclusive prefix over accepted slots reproduces the serial node numbering and
+parent compaction, and the first error in slot order stops the same writes as
+before. Node flags are cleared when children are created instead of all at
+initialization; the CPU replay reads only created nodes. This path requires
+`metal_tree_control_fusion=1`. `metal_parallel_partition_plan=1` writes each
+parent's partition tasks with its own threadgroup instead of one thread.
+None of these changes model arithmetic, and only deferral changes the number
+of dispatches.
+
+`metal_partition_single_pass=1` replaces the GPU driver's flag, serial tile
+scan and scatter passes with one scatter. Each 256-row tile reserves a run at
+the front (left rows) or the back (right rows) of its parent's segment with
+one relaxed atomic per side; the final cursors are the children's row counts,
+and an existing per-parent pass derives the same offsets as the stable scan.
+Every child receives the same row set and counts, so histogram planning and
+the smaller-sibling choice are unchanged. Row order inside a child now depends
+on tile scheduling and can vary between runs. Its consumers do not depend on
+it: histograms add exact modulo-2^64 integers, planners use counts, the next
+partition tests each row independently, and the CPU never reads row
+positions. This removes one dispatch per nonroot level.
+
+With single-pass partitioning and parallel planning,
+`metal_partition_bin_predicate=1` compares feature-major bins instead of
+gathering row-major float values. The planner finds a cut equal to the
+parent's threshold. Because quantization stores the clamped count of cuts at
+most equal to a value, `value < cut[k]` holds exactly when the bin is at
+most `k`, for every cut but the last. Last-cut and minimum thresholds and
+unsorted cuts keep the float comparison. The path requires the matrix's own
+float data, from which (or, for `QuantileDMatrix`, into which) its bins were
+quantized. Inputs recoded after a feature-type change keep the float
+comparison. The CPU-driven builder keeps the stable partition. Set these
+options to zero for same-binary controls.
+
 The default `metal_terminal_histogram_elision=1` path omits derived-sibling
 histogram stores and their device barrier at the configured final GPU-tree depth.
 It subtracts the parent and built-sibling bins directly into the unchanged
@@ -410,6 +463,145 @@ Latest-tree fields `histogram_compact_scratch`, `histogram_clear_built`, and
 `fused_score` report selected paths, not counts of executed operations. Setting
 all three parameters to zero provides a same-binary control for these changes.
 
+The default `metal_split_screening=1` path runs the software scorer only for
+candidates that can still win. Each lane encloses the exact float32 gain of its
+forward and backward candidates using native float32 arithmetic. Every native
+result steps one or more ulps outward, which holds under round-to-nearest-even
+or round-toward-zero. The 24-bit truncation of each integer sum brackets its
+binary64 value. The child gain then lies within `G^2 / (H + lambda)` times
+`1 +- 2^-22`: the error from rounding the weight cancels at the optimum.
+Magnitude guards keep every operand normal. A candidate is skipped only when
+its upper bound is below the best lower bound certified in its node, so its
+exact gain is strictly smaller and it can neither win nor tie. Uncertain cases
+always run the exact scorer, for example a Hessian next to `min_child_weight`
+or an out-of-range statistic. Certainly invalid candidates have no effect on
+the result. Survivors are packed into the first lanes, so exact scoring
+usually occupies one SIMD group. Each lane scores at most one survivor, and
+the reduction keeps the original gain, then candidate order, tie rule.
+Selection requires zero L1 regularization, no `max_delta_step` clamp, finite
+`reg_lambda` and `min_child_weight`, and no monotone constraints. Kernels also
+recheck node bounds and each feature's constraint. Screened twins replace the
+GPU driver's skip-empty sparse and compact nonroot scorers, and the host
+driver's descendant scorers when `fallback_parallel_splits` is selected (see
+its cut-count default above); the host's 32-lane evaluator stays unscreened.
+Without the
+node cutoff below, each per-feature `Split` is byte-identical to its
+unscreened twin.
+
+`metal_split_screening_root` applies the same screening to the parallel root
+scorer of either driver. It defaults to one for missing-containing input,
+where each lane otherwise scores forward and backward candidates, and to zero
+for dense input. A dense root scores one candidate per lane in a few
+latency-bound threadgroups, and screening lengthened that dispatch in local
+measurements.
+
+`metal_split_node_cutoff=1` shares certified lower bounds between the feature
+groups of one node. Each GPU-driver level has its own cells, updated with a
+32-bit atomic maximum of an order-preserving key and cleared once per tree.
+Any value read is a valid bound, including a stale one. Cutoffs avoid the
+subnormal and zero band, because comparisons may flush subnormal gains to
+zero. Every candidate tied with the node maximum survives, so features that
+can win write byte-identical records. Other features may skip candidates, or
+write a losing `-inf` record when nothing survives. Split selection
+(`select_splits`, or `select_splits_simd` with `metal_parallel_select`), the
+only consumer, keeps the first strictly greater gain, so these records cannot
+be selected. The exact parent statistics are computed only when a feature group
+has survivors or has seen no certified bound. Host-driven trees that select
+the fallback scorer use only the per-feature cutoff.
+
+With screening, `metal_split_inherit_parent=1` takes a GPU-driver child's exact
+weight and cover from its parent's selected split. The GPU apply step has
+already written that split, and its scorer computed both values from the
+child's integer sums. The child then recomputes only its gain and gradient
+total, with the same functions, avoiding the parent division and a barrier.
+The GPU driver's node bounds are infinite, so these weights are unclamped.
+The root and host-driven trees compute parent statistics as before.
+`split_inherit_parent` reports selection; set it to zero for a control.
+
+Latest-tree tuning fields `split_screening`, `root_screening` and
+`split_node_cutoff` report selection. `metal_split_screening_stats=1` adds
+cumulative counters to the profile's `split_screening` object; asynchronous
+rounds (`metal_async_rounds`) do not collect them. They record evaluated candidates,
+certified and uncertain candidates, exactly scored survivors, feature groups,
+and groups with survivors. Set `metal_split_screening=0` for a same-binary
+control. Models and predictions are unchanged. `tests/split_screening_probe.metal`
+and `tests/split_screening_bounds.cpp` (CMake option `METALGB_BUILD_TESTS`)
+check enclosures against every exact scorer family on adversarial integer
+sums. They also compare screened and unscreened kernel records byte for byte.
+
+Four GPU-tree histogram dataflow options change only how bin codes, tasks and
+sums move. Every row still adds the same exact integer gradient and Hessian to
+the same bin, so histograms, models and predictions are unchanged. They apply
+to dense input, or to missing-valued input with `metal_histogram_missing=1`;
+`metal_histogram_missing=0` with missing values keeps the original kernels.
+Each option has a same-binary zero control, and latest-tree fields
+`histogram_packed_bins`, `histogram_schedule`, `histogram_single_owner` and
+`histogram_unit_hessian` report selection. Host-driven trees keep the
+original histogram kernels.
+
+`metal_histogram_packed_bins` (default 16) reads a derived uint8 copy of the
+bin codes. Four features share one 32-bit word. With 16, each row stores 16
+features in one 16-byte chunk; with 4, each word group is a separate array.
+Narrower matrices use only the words they need. A grouped task then
+loads one 4-byte word per row instead of four scattered 2-byte column gathers.
+At deep levels, a node's rows are a sparse subset of all rows, so this greatly
+reduces the memory sectors fetched. The copy is built once per quantization
+and chunk width, and the canonical uint16 bins remain authoritative. It needs
+one, two or four features per group and every code within 8 bits: at most
+256 bins for dense input, or 255 with code 255 marking missing values. Other
+inputs, including 256-bin data with missing values, keep the uint16 bins. The
+copy adds one byte per row and padded feature. With packing enabled, dense
+numeric scalar inputs with at least 16384 rows also default to four features
+per histogram group, like the existing large-data grouping. This default also
+applies to host-driven depthwise trees, where it measured neutral to slightly
+faster, but not to lossguide trees, whose small per-leaf histograms ran slower
+grouped; `metal_features_per_group` remains an explicit override.
+
+`metal_histogram_schedule` replaces `plan_histograms`' per-group task records
+with one record per row tile. Each threadgroup derives its feature group from
+its index, so planning writes up to 64 times fewer records. Value 1 orders
+threadgroups group-major, keeping one feature column hot across a level's
+nodes. Value 2 orders them tile-major, running the groups that share a tile's
+row IDs, gradients and 16-byte packed chunk back to back. The default is 2
+with 16-feature chunks and 1 otherwise. Zero selects the original records.
+
+`metal_histogram_single_owner=1` lets the only threadgroup building a node's
+feature group publish it with plain 16-byte stores. Planning tags nodes that
+fit in one row tile, and `fill_histogram_built` skips their slices. The store
+writes every bin, including zero bins, and 0 + total is the same modulo-2^64
+sum. A missing bin is cleared before its SIMD-group sums are added. Zero-row
+built nodes still receive the fill. Shared slices no longer add zero pairs.
+
+`metal_histogram_unit_hessian` targets unweighted squared error. Every row
+then has the same quantized Hessian, so a bin's Hessian sum is its row count
+times that constant, modulo 2^64. Threadgroups add only gradients plus a 32-bit
+count, then multiply at flush. A GPU check per tree compares every row's
+quantized Hessian with the first row's; on any difference, the tree uses the
+original sums. The check, its flag clear on the GPU and the node-cutoff clear
+share the tree's initialization encoder. Custom objectives that return varying Hessians therefore fall
+back automatically. Because the check reads every row once per tree, the
+default selects counting only when feature groups times maximum depth is at
+least four; one feature group at depth two was 2-3% slower with it. `histogram_unit_hessian` reports whether the counts were
+used after this check; asynchronous rounds, which never carry caller-supplied
+gradients, report the selection.
+
+Setting `METALGB_DISPATCH_PROFILE=<path>` gives every dispatch and buffer fill
+its own encoder with GPU start and end timestamps. Command coalescing is
+disabled, and at process exit the per-kernel dispatch counts and GPU seconds
+are written to `<path>` as JSON. Models are unchanged. Metal limits a process
+to 32 live counter sample buffers of 2048 dispatches each. Dispatches beyond
+that, for example in one command with more than 65536 dispatches or many
+boosters with asynchronous rounds in flight, are counted under
+`<kernel> (untimed)`.
+
+With per-dispatch timestamps (`METALGB_DISPATCH_PROFILE`) on an M4 Max, the
+800k-row by 128-feature dense depth-six case spent about 11 ms per tree in
+histogram kernels with all four options set to zero, and about 3.6 ms with
+the defaults. Before, each level from depth two onward cost 1.0-3.4 ms, more
+than the first two levels together, because scattered 2-byte gathers
+amplified memory traffic. With packed bins and tile-major records, the first
+two levels took about 1.5 ms and each deeper level 0.5-0.8 ms.
+
 The `XGBoosterMetalProfile` extension reports the combined gradient/root GPU
 interval as `gradient_root`; add it to the remaining tree intervals when
 comparing GPU work. A complete GPU-driven tree is reported as `gpu_tree`, or
@@ -421,6 +613,102 @@ depth levels, and the scratch-size estimate. The tuning fields `tree_fixed_works
 `tree_buffer_allocations` includes the four setup slots when this reuse is
 enabled. Ordinary same-shape training allocates these slots once and then
 reuses them without changing model or prediction bits.
+
+## Host-side round streamlining
+
+Each boosting round also repeats host work outside the GPU kernels. The
+following exact trims are independently controlled; all default to one and
+change neither kernel arithmetic, dispatch order nor model bytes.
+
+- `metal_round_buffers` keeps the gradient pairs, partial sums, scales and
+  quantized gradients alive across rounds instead of allocating fresh shared
+  buffers. Each is fully overwritten by its producing kernel before any read,
+  and the host never touches them. Custom gradients, linear models and the
+  absolute, quantile, expectile, distribution, survival and ranking objectives
+  keep fresh gradient-pair storage.
+  Training-margin outputs come from a pool: a buffer is reused only when the
+  pool holds its sole host reference, so margins returned to a caller,
+  retained by a cache or recipe, or read by a round still in flight are never
+  rewritten. Reset releases the pool.
+- `metal_gpu_row_init` writes the initial row identities of a GPU-driven tree
+  with one dispatch in the driver's initialization encoder, instead of a host
+  loop over every row. Host-driven trees keep the host loop.
+- `metal_tree_constant_inputs` skips rewriting the retained monotone, feature
+  mask and bound slots when their bytes equal the slot's previous host write
+  and no other request has used the slot since. These inputs are read-only on
+  the GPU; changed bytes are copied as before.
+- `metal_replay_path_elision` omits interaction-path bookkeeping (a set copy
+  per expansion) from the host replay of GPU-driven trees, which exclude
+  interaction constraints. It mainly helps depth-ten trees.
+- `metal_commit_early` commits the prediction/gradient/quantization prologue
+  before the host builds and encodes the tree, continuing in a second command
+  buffer on the same queue. One wait covers both; `gradient_tree` reports the
+  sum of their GPU intervals and the command count is unchanged. Explicitly
+  coalesced prologues (`metal_coalesce_encoders=1`) and asynchronous rounds
+  keep one command buffer.
+- `metal_parameter_snapshot` skips re-parsing the purely parameter-dependent
+  training checks while the parameters equal the last validated set. Any
+  change, including an invalid value, is validated again.
+
+Latest-tree fields `round_buffers`, `gpu_row_init`, `tree_constant_inputs`,
+`replay_path_elision` and `commit_early` report selection. On the local M4 Max,
+per-round paired measurements (toggling one switch every round) attributed the
+largest savings to round buffers on shallow trees and to path elision on
+depth-ten trees; row initialization and constant inputs mainly remove host
+stores that asynchronous rounds would otherwise have to avoid.
+
+## Asynchronous boosting rounds
+
+`metal_async_rounds=K` (default zero) lets up to K eligible rounds remain in
+flight when `Booster.update` returns, in the range one to four. Each round's
+command ends with one extra dispatch that emits the host replay's Node table
+for the finished tree. Its leaf values use an exact software binary32
+multiplication with round-to-nearest-even and gradual underflow, because Metal
+arithmetic flushes subnormals. The next round's deferred margin update runs the
+unchanged `predict` kernel over that single-tree table, with the same tree range
+and floating-point additions as the forest recipe. No round therefore waits
+for the host model, and host setup, Python and encoding overlap GPU work.
+
+Rounds retire in order. Retirement waits for the command if needed, replays
+the tree from the driver history with the original host assignments, compares
+the emitted Node bytes with the replay and only then publishes the tree. A
+Metal error, invalid driver state or any byte difference rolls the model back
+to the last retired round, discards later rounds and training-margin caches,
+and raises the error from that call. Errors are therefore reported up to K
+calls late. The CPU replay remains the only source of the model. Random-number
+state used for column sampling is not rolled back, so training resumed after a
+failure with `colsample_*` (and `seed_per_iteration=0`) differs from
+uninterrupted training, as it does after a synchronous failure.
+
+Eligibility is the deferred-prediction eligibility above plus an eligible
+GPU-driven tree. Other updates retire committed rounds first; a tree that turns
+out to need the host driver retires them before its first host workspace
+store. Prediction, evaluation with data, model/config save and load, dumps,
+slicing, feature scores, `XGBoosterBoostedRounds`, `XGBoosterMetalProfile`,
+reset, model-changing configuration and booster destruction also retire every
+round. Attribute and feature-metadata calls, parameter changes and evaluation
+without data do not, so an ordinary `xgb.train` loop waits only in its final
+reset. Evaluation sets, early stopping or per-round profile reads drain every
+round and remove the benefit.
+
+While rounds are in flight, retained host-written tree inputs are never
+overwritten: unchanged constant inputs are reused, changed inputs and host row
+identities use new allocations, and driver readback and emitted tables come
+from a pool that keeps a round's buffers until it retires. GPU-only scratch is
+shared by consecutive rounds and ordered by the single command queue. The
+latest-tree field `async_rounds` reports K for an asynchronous round, and
+retirement order defines the remaining latest-tree fields.
+
+Leaf scaling can be checked exhaustively with the optional extension
+`XGBMetalValidateLeafScaling(eta, begin, count, &mismatches, &first)`, which
+compares the GPU multiplication with the host product for consecutive binary32
+weight patterns. All 2^32 weights matched for every learning rate tested. For
+tests only, `metal_async_fault` (1: emitted metadata, 2: driver state) with
+`metal_async_fault_round` corrupts one round after emission to exercise
+rollback. On the local M4 Max, same-process alternating `xgb.train` runs with
+K=2 removed nearly all of the host and synchronization gap between rounds;
+shallow trees benefited most. Report asynchronous timings together with the
+training API and evaluation cadence used.
 
 ## Forest upload diagnostics
 

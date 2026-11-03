@@ -26,6 +26,7 @@ Json objective_config(Learner const& learner) {
 }
 }
 Json Learner::model() {
+  drain();
   configure();
   require(tree_weights_.size() <= trees.size(), "Tree weights cannot exceed the number of active trees.");
   Json serialized = Json::array(), tree_info = Json::array(), iteration_ptr = Json::array();
@@ -73,6 +74,7 @@ Json Learner::model() {
   return {{"version", {3, 5, 0}}, {"learner", learner}};
 }
 void Learner::load_model(Json const& input) {
+  drain();
   auto const& learner = input.at("learner");
   auto const& booster = learner.at("gradient_booster");
   auto name = booster.at("name").get<std::string>();
@@ -241,6 +243,7 @@ void Learner::load_model(Json const& input) {
   rounds = new_rounds; initialized = true; reset();
 }
 Json Learner::config() {
+  drain();
   configure();
   Json train;
   for (auto const& [key, value] : std::map<std::string, std::string>{{"learning_rate", "0.300000012"}, {"reg_lambda", "1"}, {"reg_alpha", "0"}, {"min_child_weight", "1"}, {"min_split_loss", "0"}, {"max_depth", "6"}, {"max_leaves", "0"}, {"max_bin", "256"}, {"subsample", "1"}, {"colsample_bytree", "1"}, {"colsample_bylevel", "1"}, {"colsample_bynode", "1"}, {"max_delta_step", "0"}, {"grow_policy", "depthwise"}, {"sampling_method", "uniform"}, {"monotone_constraints", "()"}, {"interaction_constraints", ""}, {"max_cat_to_onehot", "4"}, {"max_cat_threshold", "64"}, {"refresh_leaf", "1"}, {"sparse_threshold", "0.2"}}) train[key] = str(key, value);
@@ -282,6 +285,7 @@ Json Learner::config() {
     {"metrics", metric}, {"objective", objective_config(*this)}}}};
 }
 void Learner::load_config(Json const& document) {
+  drain();
   auto const& learner = document.at("learner");
   auto const& objective = learner.at("objective");
   set_param("objective", objective.at("name").get<std::string>());
@@ -328,6 +332,7 @@ void Learner::load_config(Json const& document) {
   reset(false);
 }
 std::vector<std::string> Learner::dump(std::string_view format, bool stats) {
+  drain();
   configure();
   if (is_linear()) return dump_linear(format);
   require(format == "text" || format == "json" || format == "dot", "Unknown dump format.");
@@ -423,6 +428,7 @@ std::vector<std::string> Learner::dump(std::string_view format, bool stats) {
   return result;
 }
 std::unique_ptr<Learner> Learner::slice(int begin, int end, int step) {
+  drain();
   configure();
   require(!is_linear(), "Slice is not supported by the current booster.");
   require(trees_to_update_.empty() || trees_to_update_.size() == trees.size(),

@@ -542,6 +542,7 @@ void Matrix::quantize(u32 requested_bins, Matrix const* reference) {
   max_bin = requested_bins;
   quantized_types_changed_ = reference && reference->quantized_types_changed_;
   partition_data_ = {}; partition_bounds_ = {};
+  packed_bins_ = {}; packed_chunk_ = 0;
   export_cuts();
 }
 void Matrix::decode_quantiles(Buffer const& output, bool representative, bool numeric_only) const {
@@ -588,6 +589,24 @@ Buffer Matrix::partition_data() const {
     decode_quantiles(partition_data_, false, !cuts_categorical_);
   }
   return partition_data_;
+}
+Buffer Matrix::packed_bins(u32 chunk) const {
+  if (!bins || !rows || !cols || histogram_bins > 256) return {};
+  std::lock_guard lock(recode_mutex_);
+  if (packed_chunk_ != chunk) {
+    // Built once per quantization and chunk width. An unrepresentable code
+    // is also remembered, so later trees do not repeat the conversion.
+    auto groups = div_up(div_up(cols, 4), chunk) * chunk;
+    Buffer packed(checked_product(checked_product(groups, rows), sizeof(u32)));
+    Buffer invalid(sizeof(u32)); invalid.zero();
+    PackBinsParams p{rows, cols, histogram_bins, chunk};
+    Command command("pack histogram bins");
+    command.dispatch("pack_histogram_bins", {bins, packed, invalid}, p, {div_up(rows, 256), groups, 1});
+    command.wait();
+    packed_bins_ = invalid.as<u32>()[0] ? Buffer{} : std::move(packed);
+    packed_chunk_ = chunk;
+  }
+  return packed_bins_;
 }
 Buffer Matrix::partition_category_bounds() const {
   if (!quantized_types_changed_ || cuts_categorical_) return {};
@@ -708,5 +727,6 @@ void Matrix::append(Matrix const& batch) {
   data = Buffer(values.data(), values.size() * sizeof(float));
   feature_names = batch.feature_names; feature_types = batch.feature_types;
   max_bin = 0; ++generation; refresh_metadata();
+  packed_bins_ = {}; packed_chunk_ = 0;
 }
 }  // namespace metalgb

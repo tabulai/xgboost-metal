@@ -3,6 +3,8 @@
 #include <nlohmann/json.hpp>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -124,23 +126,124 @@ bool Buffer::reserve(std::size_t bytes, std::size_t preserve_bytes) {
   *this = std::move(grown);
   return true;
 }
+namespace {
+// Diagnostic only: isolates every dispatch in its own encoder so that
+// stage-boundary timestamps attribute GPU time to individual kernels.
+struct DispatchTotals {
+  struct Entry { std::uint64_t count{0}; double seconds{0}; };
+  std::mutex mutex;
+  std::map<std::string, Entry> kernels;
+  std::string path;
+  id<MTLCounterSet> counters{nil};
+  static DispatchTotals* get() {
+    static DispatchTotals* totals = [] () -> DispatchTotals* {
+      char const* path = std::getenv("METALGB_DISPATCH_PROFILE");
+      if (!path || !*path) return nullptr;
+      auto result = new DispatchTotals;
+      result->path = path;
+      auto device = (id<MTLDevice>)Runtime::get().device();
+      for (id<MTLCounterSet> set in device.counterSets)
+        if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) result->counters = [set retain];
+      if (!result->counters) throw std::runtime_error("No Metal timestamp counters.");
+      std::atexit([] {
+        auto t = DispatchTotals::get();
+        nlohmann::json out = nlohmann::json::object();
+        for (auto const& [name, e] : t->kernels) out[name] = {{"count", e.count}, {"seconds", e.seconds}};
+        if (auto f = std::fopen(t->path.c_str(), "w")) { auto text = out.dump(1); std::fwrite(text.data(), 1, text.size(), f); std::fclose(f); }
+      });
+      return result;
+    }();
+    return totals;
+  }
+};
+}
+struct Command::Profile {
+  // Metal caps live counter sample buffers per process (32 on M4) and a
+  // buffer at 32 KB (4096 timestamps). Dispatches beyond that are counted
+  // under "<kernel> (untimed)" instead of failing the command.
+  static constexpr NSUInteger kSamples = 4096;
+  std::vector<id<MTLCounterSampleBuffer>> buffers;
+  std::vector<std::string> names, untimed;
+  MTLTimestamp cpu0{0}, gpu0{0};
+  ~Profile() { for (auto b : buffers) [b release]; }
+  std::pair<id<MTLCounterSampleBuffer>, NSUInteger> next(std::string_view kernel) {
+    auto index = names.size() * 2 % kSamples;
+    if (index == 0) {
+      auto descriptor = [[[MTLCounterSampleBufferDescriptor alloc] init] autorelease];
+      descriptor.counterSet = DispatchTotals::get()->counters;
+      descriptor.storageMode = MTLStorageModeShared;
+      descriptor.sampleCount = kSamples;
+      NSError* error = nil;
+      auto buffer = [(id<MTLDevice>)Runtime::get().device() newCounterSampleBufferWithDescriptor:descriptor error:&error];
+      if (!buffer) { untimed.emplace_back(kernel); return {nil, 0}; }
+      buffers.push_back(buffer);
+    }
+    names.emplace_back(kernel);
+    return {buffers.back(), index};
+  }
+  void finish() {
+    MTLTimestamp cpu1 = 0, gpu1 = 0;
+    [(id<MTLDevice>)Runtime::get().device() sampleTimestamps:&cpu1 gpuTimestamp:&gpu1];
+    double scale = (gpu1 > gpu0 && cpu1 > cpu0) ? 1e-9 * double(cpu1 - cpu0) / double(gpu1 - gpu0) : 1e-9;
+    auto totals = DispatchTotals::get();
+    std::lock_guard lock(totals->mutex);
+    for (std::size_t b = 0; b < buffers.size(); ++b) {
+      auto first = b * (kSamples / 2);
+      auto count = std::min<std::size_t>(kSamples / 2, names.size() - first);
+      NSData* data = [buffers[b] resolveCounterRange:NSMakeRange(0, count * 2)];
+      auto stamps = data ? static_cast<MTLCounterResultTimestamp const*>(data.bytes) : nullptr;
+      for (std::size_t i = 0; i < count; ++i) {
+        auto& entry = totals->kernels[names[first + i]];
+        ++entry.count;
+        if (!stamps) continue;
+        auto begin = stamps[2 * i].timestamp, end = stamps[2 * i + 1].timestamp;
+        if (begin && begin != MTLCounterErrorValue && end != MTLCounterErrorValue && end >= begin)
+          entry.seconds += double(end - begin) * scale;
+      }
+    }
+    for (auto const& name : untimed) ++totals->kernels[name + " (untimed)"].count;
+  }
+};
+namespace {
+id<MTLCommandBuffer> new_command_buffer(std::string const& label) {
+  id<MTLCommandBuffer> command = [(id<MTLCommandQueue>)Runtime::get().queue() commandBuffer];
+  if (!command) throw std::runtime_error("Cannot allocate Metal command buffer.");
+  [command retain];
+  command.label = [NSString stringWithUTF8String:label.c_str()];
+  return command;
+}
+}
 Command::Command(std::string_view label, bool coalesce, bool compute_fill)
-    : coalesce_(coalesce), compute_fill_(compute_fill) {
+    : label_(label), coalesce_(coalesce), compute_fill_(compute_fill) {
   @autoreleasepool {
-    id<MTLCommandBuffer> command = [(id<MTLCommandQueue>)Runtime::get().queue() commandBuffer];
-    if (!command) throw std::runtime_error("Cannot allocate Metal command buffer.");
-    [command retain];
-    command.label = [NSString stringWithUTF8String:std::string(label).c_str()];
-    object_ = (void*)command;
+    if (DispatchTotals::get()) { profile_ = std::make_unique<Profile>(); coalesce_ = false; }
+    object_ = (void*)new_command_buffer(label_);
   }
 }
-Command::~Command() { end_compute(); [(id<MTLCommandBuffer>)object_ release]; }
-void* Command::begin_compute() {
+Command::~Command() {
+  end_compute();
+  for (auto command : flushed_) [(id<MTLCommandBuffer>)command release];
+  [(id<MTLCommandBuffer>)object_ release];
+}
+void* Command::begin_compute(std::string_view kernel) {
   if (!encoder_) {
     // Serial encoders make each dispatch's writes visible to the next one,
     // including GPU-produced indirect arguments. No concurrent dispatches are
     // used here: the histogram and partition kernels depend on their inputs.
-    auto encoder = [(id<MTLCommandBuffer>)object_ computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    id<MTLComputeCommandEncoder> encoder;
+    if (profile_) {
+      auto [sample, index] = profile_->next(kernel);
+      auto descriptor = [MTLComputePassDescriptor computePassDescriptor];
+      descriptor.dispatchType = MTLDispatchTypeSerial;
+      if (sample) {
+        descriptor.sampleBufferAttachments[0].sampleBuffer = sample;
+        descriptor.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
+        descriptor.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1;
+      }
+      encoder = [(id<MTLCommandBuffer>)object_ computeCommandEncoderWithDescriptor:descriptor];
+    } else {
+      encoder = [(id<MTLCommandBuffer>)object_ computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    }
     if (!encoder) throw std::runtime_error("Cannot allocate Metal compute encoder.");
     [encoder retain];
     encoder_ = (void*)encoder;
@@ -169,7 +272,7 @@ void Command::dispatch(std::string_view kernel, std::initializer_list<Buffer> bu
       if (threadgroup_bytes + pipeline.staticThreadgroupMemoryLength > device.maxThreadgroupMemoryLength)
         throw std::runtime_error("Threadgroup memory exceeds the Metal device limit.");
     }
-    auto encoder = (id<MTLComputeCommandEncoder>)begin_compute();
+    auto encoder = (id<MTLComputeCommandEncoder>)begin_compute(kernel);
     [encoder setComputePipelineState:pipeline];
     auto index = bind_buffers(encoder, buffers);
     if (size) [encoder setBytes:params length:size atIndex:index];
@@ -188,7 +291,7 @@ void Command::dispatch_indirect(std::string_view kernel, std::initializer_list<B
     auto pipeline = (id<MTLComputePipelineState>)Runtime::get().pipeline(kernel);
     if (threads.x * threads.y * threads.z > pipeline.maxTotalThreadsPerThreadgroup)
       throw std::runtime_error("Threadgroup exceeds the Metal pipeline limit.");
-    auto encoder = (id<MTLComputeCommandEncoder>)begin_compute();
+    auto encoder = (id<MTLComputeCommandEncoder>)begin_compute(kernel);
     [encoder setComputePipelineState:pipeline];
     auto index = bind_buffers(encoder, buffers);
     if (size) [encoder setBytes:params length:size atIndex:index];
@@ -207,7 +310,19 @@ void Command::zero(Buffer const& buffer) {
   }
   @autoreleasepool {
     end_compute();
-    auto encoder = [(id<MTLCommandBuffer>)object_ blitCommandEncoder];
+    id<MTLBlitCommandEncoder> encoder;
+    if (profile_) {
+      auto [sample, index] = profile_->next("fill_buffer");
+      auto descriptor = [MTLBlitPassDescriptor blitPassDescriptor];
+      if (sample) {
+        descriptor.sampleBufferAttachments[0].sampleBuffer = sample;
+        descriptor.sampleBufferAttachments[0].startOfEncoderSampleIndex = index;
+        descriptor.sampleBufferAttachments[0].endOfEncoderSampleIndex = index + 1;
+      }
+      encoder = [(id<MTLCommandBuffer>)object_ blitCommandEncoderWithDescriptor:descriptor];
+    } else {
+      encoder = [(id<MTLCommandBuffer>)object_ blitCommandEncoder];
+    }
     if (!encoder) throw std::runtime_error("Cannot allocate Metal blit encoder.");
     ++encoder_count_;
     [encoder fillBuffer:(id<MTLBuffer>)buffer.native() range:NSMakeRange(0, buffer.size()) value:0];
@@ -216,16 +331,52 @@ void Command::zero(Buffer const& buffer) {
 }
 void Command::set_coalescing(bool enabled) {
   if (submitted_) throw std::logic_error("Cannot change a committed Metal command buffer.");
+  if (profile_) return;
   if (coalesce_ != enabled) { end_compute(); coalesce_ = enabled; }
+}
+void Command::submit_current() {
+  end_compute();
+  if (profile_ && !started_)
+    [(id<MTLDevice>)Runtime::get().device() sampleTimestamps:&profile_->cpu0 gpuTimestamp:&profile_->gpu0];
+  started_ = true;
+  [(id<MTLCommandBuffer>)object_ commit];
+}
+void Command::flush() {
+  if (submitted_) throw std::logic_error("Cannot flush a committed Metal command buffer.");
+  @autoreleasepool {
+    // Allocate first: a failed allocation leaves this command unchanged.
+    auto next = new_command_buffer(label_);
+    submit_current();
+    flushed_.push_back(object_);
+    object_ = (void*)next;
+  }
+}
+void Command::commit() {
+  if (submitted_) return;
+  @autoreleasepool { submit_current(); submitted_ = true; }
+}
+bool Command::completed() const {
+  if (!submitted_) return false;
+  // One queue completes command buffers in submission order.
+  return [(id<MTLCommandBuffer>)object_ status] >= MTLCommandBufferStatusCompleted;
 }
 double Command::wait() {
   @autoreleasepool {
     auto command = (id<MTLCommandBuffer>)object_;
-    if (!submitted_) { end_compute(); [command commit]; submitted_ = true; }
+    commit();
     [command waitUntilCompleted];
-    if (command.status == MTLCommandBufferStatusError)
-      throw std::runtime_error("Metal execution failed: " + error_text(command.error));
-    return command.GPUEndTime - command.GPUStartTime;
+    if (profile_) { profile_->finish(); profile_.reset(); }
+    double elapsed = 0;
+    for (std::size_t i = 0; i <= flushed_.size(); ++i) {
+      auto buffer = i < flushed_.size() ? (id<MTLCommandBuffer>)flushed_[i] : command;
+      // Earlier buffers completed before the last one on this queue.
+      if (buffer.status != MTLCommandBufferStatusCompleted && buffer.status != MTLCommandBufferStatusError)
+        [buffer waitUntilCompleted];
+      if (buffer.status == MTLCommandBufferStatusError)
+        throw std::runtime_error("Metal execution failed: " + error_text(buffer.error));
+      elapsed += buffer.GPUEndTime - buffer.GPUStartTime;
+    }
+    return elapsed;
   }
 }
 }  // namespace metalgb

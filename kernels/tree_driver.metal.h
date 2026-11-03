@@ -127,12 +127,16 @@ kernel void tree_driver_prepare(device const TreeDriverState* state [[buffer(0)]
   // counters every level, including an empty/error frontier in a reused bank.
   plan_histogram_args[0] = TreeDriverDispatch{(nodes + 63) / 64, 1, 1};
   histogram_args[0] = TreeDriverDispatch{0, 1, 1};
-  plan_partition_args[0] = TreeDriverDispatch{(parents + 63) / 64, 1, 1};
+  // Parallel planning uses one threadgroup per parent; parallel selection uses
+  // one SIMD-group threadgroup per node. Zero flags keep the original grids.
+  plan_partition_args[0] = TreeDriverDispatch{
+      p.control_flags & kTreeDriverParallelPlan ? parents : (parents + 63) / 64, 1, 1};
   partition_args[0] = TreeDriverDispatch{0, 1, 1};
   partition_scan_args[0] = TreeDriverDispatch{(parents + 63) / 64, 1, 1};
   uint features = p.parallel_splits ? p.split.cols : (p.split.cols + 63) / 64;
   evaluate_args[0] = TreeDriverDispatch{nodes ? features : 0, nodes, 1};
-  select_args[0] = TreeDriverDispatch{(nodes + 63) / 64, 1, 1};
+  select_args[0] = TreeDriverDispatch{
+      p.control_flags & kTreeDriverParallelSelect ? nodes : (nodes + 63) / 64, 1, 1};
   subtract_args[0] = TreeDriverDispatch{
       nodes ? (p.histogram_entries + 255) / 256 : 0,
       histogram[0].subtract ? parents : 0, 1};

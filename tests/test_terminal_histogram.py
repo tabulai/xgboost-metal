@@ -31,9 +31,10 @@ def test_default_matches_explicit_terminal_controls(compact):
     assert_identical(results[0], results[2])
 
 
+@pytest.mark.parametrize("screening", [0, 1])
 @pytest.mark.parametrize("depth,compact,missing,fast_stats", list(itertools.product(
     [6, 8, 10], [0, 1], [False, True], [0, 1])))
-def test_terminal_parallel_and_compact_paths_are_exact(depth, compact, missing, fast_stats):
+def test_terminal_parallel_and_compact_paths_are_exact(depth, compact, missing, fast_stats, screening):
     X, y = inputs(rows=1025, density=0.65)
     if not missing:
         X = np.nan_to_num(X)
@@ -41,7 +42,10 @@ def test_terminal_parallel_and_compact_paths_are_exact(depth, compact, missing, 
     for enabled in [0, 1]:
         result, traces = fit(X, y, 1, bins=256, rounds=2, params={
             "max_depth": depth, "metal_compact_splits": compact,
-            "metal_fast_stats": fast_stats, "metal_terminal_histogram_elision": enabled})
+            "metal_fast_stats": fast_stats, "metal_terminal_histogram_elision": enabled,
+            "metal_split_screening": screening})
+        # Screened twins replace these kernels by default; cover both.
+        assert all(t["tuning"]["split_screening"] == screening for t in traces)
         assert all(t["tuning"]["gpu_tree"] == 1 for t in traces)
         assert all(t["tuning"]["terminal_histogram_elision"] == enabled for t in traces)
         results.append(result)
@@ -89,7 +93,8 @@ def test_unsupported_paths_do_not_elide_histograms(params):
 ])
 def test_terminal_kernel_and_histogram_variants(params):
     X, y = inputs(rows=1025, density=0.65)
-    options = {"max_depth": 6, "metal_compact_splits": 0, "metal_fast_stats": 1, **params}
+    options = {"max_depth": 6, "metal_compact_splits": 0, "metal_fast_stats": 1,
+               "metal_split_screening": 0, **params}
     results = []
     for enabled in [0, 1]:
         result, traces = fit(X, y, 1, bins=256, rounds=2, params={
@@ -101,6 +106,7 @@ def test_terminal_kernel_and_histogram_variants(params):
             # these specialized kernels. Require actual terminal-depth work.
             assert tuning["gpu_tree_levels"] == options["max_depth"]
             assert tuning["terminal_histogram_elision"] == enabled
+            assert tuning["split_screening"] == 0
             assert tuning["compact_splits"] == options["metal_compact_splits"]
             assert tuning["fast_stats"] == options["metal_fast_stats"]
             assert tuning["histogram_present"] == options.get("metal_histogram_present", 0)

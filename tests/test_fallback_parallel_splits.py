@@ -101,14 +101,16 @@ def test_bin_layout_and_statistics_variants(bins, kind, fast_stats):
     compare(X, y, bins=bins, rounds=2, params={"metal_fast_stats": fast_stats})
 
 
+@pytest.mark.parametrize("screening", [0, 1])
 @pytest.mark.parametrize("compact,fast_stats,fused_score", list(itertools.product([0, 1], repeat=3)))
-def test_compact_statistics_and_score_controls_match_serial(compact, fast_stats, fused_score):
+def test_compact_statistics_and_score_controls_match_serial(compact, fast_stats, fused_score, screening):
     X, y = inputs(rows=513, density=0.65)
     X = np.nan_to_num(X)
     options = {"metal_gpu_tree": 0, "metal_compact_splits": compact,
                "metal_fast_stats": fast_stats, "metal_fused_score": fused_score,
-               "metal_terminal_histogram_elision": 1}
-    actual, _ = compare(X, y, bins=128, rounds=2, params=options)
+               "metal_terminal_histogram_elision": 1, "metal_split_screening": screening}
+    actual, stats = compare(X, y, bins=128, rounds=2, params=options)
+    assert all(t["tuning"]["split_screening"] == screening for t in stats)
     serial, traces = fit(X, y, 1, bins=128, rounds=2,
                          params={**options, "metal_parallel_splits": 0,
                                  "metal_fallback_parallel_splits": 1})
