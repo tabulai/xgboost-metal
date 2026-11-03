@@ -70,7 +70,9 @@ def compare(X, y, *, params=None, expected_active=1, allow_root_only=False, **kw
 def test_default_matches_explicit_descendant_controls(missing):
     X, y = inputs(rows=513, density=0.6)
     if not missing:
-        X = np.nan_to_num(X)
+        # Distinct fill values keep about 256 cuts per feature, where the
+        # default selects this path (zeros would leave too few cuts).
+        X = np.where(np.isnan(X), np.random.default_rng(31).normal(size=X.shape), X).astype(np.float32)
     results = []
     for enabled in [0, 1, None]:
         options = {"metal_gpu_tree": 0, "max_depth": 8}
@@ -383,3 +385,27 @@ def test_dense_skip_does_not_enable_other_host_paths(params):
         assert all(t["tuning"]["compact_splits"] == t["tuning"]["fused_score"] == 0 for t in traces)
         results.append(result)
     assert_identical(*results)
+
+
+@pytest.mark.parametrize("missing,bins,levels,expected", [
+    (False, 64, None, 0), (False, 192, None, 0), (False, 256, None, 1),
+    (True, 128, None, 0), (True, 160, None, 0), (True, 192, None, 1), (False, 256, 16, 0)])
+def test_default_follows_mean_numeric_cut_count(missing, bins, levels, expected):
+    # One lane per bin: few cuts leave most of the 256 threads idle, where the
+    # original 32-lane evaluator is faster. Both selections stay exact.
+    rng = np.random.default_rng(1729)
+    if levels is None:
+        X = rng.normal(size=(4096, 6)).astype(np.float32)
+    else:
+        X = rng.integers(0, levels, size=(4096, 6)).astype(np.float32)
+    y = (X[:, 0] - 0.5 * X[:, 1] + 0.25 * X[:, 2] * X[:, 3]).astype(np.float32)
+    if missing:
+        X[rng.random(X.shape) < 0.2] = np.nan
+    options = {"metal_gpu_tree": 0, "max_depth": 6}
+    default, traces = fit(X, y, 1, bins=bins, rounds=2, params=options)
+    assert all(t["tuning"]["gpu_tree"] == 0 for t in traces)
+    assert all(t["tuning"]["fallback_parallel_splits"] == expected for t in traces)
+    explicit, controls = fit(X, y, 1, bins=bins, rounds=2,
+                             params={**options, "metal_fallback_parallel_splits": 1 - expected})
+    assert all(t["tuning"]["fallback_parallel_splits"] == 1 - expected for t in controls)
+    assert_identical(default, explicit)

@@ -66,7 +66,8 @@ def source_record(source):
     command = ["git", "-C", str(source)]
     names = subprocess.check_output(command + ["ls-files", "-z"]).decode().split("\0")
     return dict(root=str(source), head=subprocess.check_output(command + ["rev-parse", "HEAD"], text=True).strip(),
-                status=subprocess.check_output(command + ["status", "--porcelain=v1"], text=True),
+                status=subprocess.check_output(command + ["status", "--porcelain=v1", "--untracked-files=no"],
+                                               text=True),
                 diff_sha256=hashlib.sha256(subprocess.check_output(command + ["diff", "--binary", "HEAD"])).hexdigest(),
                 files_sha256={name: sha(source / name) for name in sorted(names) if name})
 
@@ -273,8 +274,10 @@ def main():
             parser.error("Every arm needs a lowercase SHA256 pin")
         arm["params"] = {**common, **arm.get("params", {})}
         expected = arm.get("expected_gpu_tree")
-        if expected is not None and not (expected in (0, 1) if isinstance(expected, int) else
-                isinstance(expected, dict) and all(k in CASES and v in (0, 1) for k, v in expected.items())):
+        # JSON booleans are ints in Python; the worker accepts only 0 or 1.
+        if expected is not None and not (expected in (0, 1) if type(expected) is int else
+                isinstance(expected, dict) and all(k in CASES and type(v) is int and v in (0, 1)
+                                                   for k, v in expected.items())):
             parser.error("expected_gpu_tree must be 0/1 or case-to-0/1 mapping")
         arms[name] = arm
     worker = HERE / "deep_tree_worker.py"
