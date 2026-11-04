@@ -52,7 +52,7 @@ def compare(case="regression", params=None, **kwargs):
     return expected, actual
 
 
-@pytest.mark.parametrize("case", ["regression", "missing", "ties", "weighted", "constant", "empty"])
+@pytest.mark.parametrize("case", ["regression", "missing", "ties", "weighted", "constant", "empty", "multiclass"])
 @pytest.mark.parametrize("depth", [2, 6, 10])
 def test_exact_outputs_and_one_saved_wait_per_unobserved_round(case, depth):
     expected, actual = compare(case, {"max_depth": depth})
@@ -80,7 +80,6 @@ def test_ordinary_scalar_objectives_preserve_rounding(objective):
     ("regression", {"subsample": 0.7}, False),
     ("regression", {}, True),
     ("categorical", {}, False),
-    ("multiclass", {}, False),
     ("parallel", {}, False),
     ("vector", {}, False),
     ("dropout", {}, False),

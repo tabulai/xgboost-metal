@@ -161,7 +161,7 @@ def test_unit_hessian_objectives_and_weights(objective, weighted, unit, missing)
     assert all(item["tuning"]["gpu_tree"] == 1 for item in stats)
 
 
-@pytest.mark.parametrize("case", ["multiclass", "parallel", "weighted", "base_margin", "bytree"])
+@pytest.mark.parametrize("case", ["multiclass", "parallel", "weighted", "base_margin", "bytree", "sampling"])
 def test_group_offsets_metadata_and_column_sampling(case):
     X, y = inputs(rows=1025, density=0.8)
     X = np.nan_to_num(X)
@@ -175,10 +175,12 @@ def test_group_offsets_metadata_and_column_sampling(case):
         metadata["weight"] = np.linspace(0, 2, len(y), dtype=np.float32)
     elif case == "base_margin":
         metadata["base_margin"] = np.linspace(-0.5, 0.4, len(y), dtype=np.float32)
+    elif case == "sampling":
+        params["subsample"] = 0.7
     else:
         params.update(colsample_bytree=0.6, seed_per_iteration=True)
     compare(X, y, bins=256, rounds=2, params=params, metadata=metadata,
-            expected=wanted(unit=int(case not in ("multiclass", "weighted"))))
+            expected=wanted(unit=int(case not in ("multiclass", "weighted", "sampling"))))
 
 
 @pytest.mark.parametrize("kind", ["csr", "csc", "quantile"])
@@ -199,7 +201,7 @@ def test_depth_ten_full_frontiers_store_single_owner_slices(pruned):
 
 
 @pytest.mark.parametrize("case", ["cpu_driver", "depth_eleven", "large_bins", "vector", "categorical",
-                                  "sampling", "missing_kernel_control"])
+                                  "missing_kernel_control"])
 def test_unsupported_paths_keep_original_kernels(case):
     X, y = inputs(rows=513, density=0.5)
     params, metadata, bins = {}, {}, 128
@@ -216,8 +218,6 @@ def test_unsupported_paths_keep_original_kernels(case):
         present = ~np.isnan(X[:, 0])
         X[present, 0] = np.arange(np.count_nonzero(present)) % 5
         metadata["feature_types"] = ["c"] + ["q"] * 6
-    elif case == "sampling":
-        params["subsample"] = 0.7
     else:
         params["metal_histogram_missing"] = 0
     compare(X, y, bins=bins, rounds=2, params=params, metadata=metadata,

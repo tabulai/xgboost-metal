@@ -28,15 +28,15 @@ def compare(X, y, *, params=None, expected_active=1, **kwargs):
 
 FALLBACK_MODES = [
     pytest.param({}, id="explicit-host"),
-    pytest.param({"metal_gpu_tree": 1, "monotone_constraints": "(1,0,-1,0,0,0,0)"}, id="monotone"),
+    pytest.param({"metal_gpu_tree": 0, "monotone_constraints": "(1,0,-1,0,0,0,0)"}, id="monotone"),
     pytest.param({"metal_gpu_tree": 1, "interaction_constraints": "[[0,1,2],[3,4,5,6]]"}, id="interaction"),
-    pytest.param({"metal_gpu_tree": 1, "colsample_bytree": 0.7, "colsample_bylevel": 0.6,
+    pytest.param({"metal_gpu_tree": 0, "colsample_bytree": 0.7, "colsample_bylevel": 0.6,
                   "seed_per_iteration": True}, id="tree-level-masks"),
-    pytest.param({"metal_gpu_tree": 1, "colsample_bynode": 0.6}, id="node-masks"),
+    pytest.param({"metal_gpu_tree": 0, "colsample_bynode": 0.6}, id="node-masks"),
     pytest.param({"metal_gpu_tree": 1, "grow_policy": "lossguide", "max_depth": 0,
                   "max_leaves": 9}, id="lossguide"),
-    pytest.param({"metal_gpu_tree": 1, "subsample": 0.63}, id="uniform-sampling"),
-    pytest.param({"metal_gpu_tree": 1, "subsample": 0.63,
+    pytest.param({"metal_gpu_tree": 0, "subsample": 0.63}, id="uniform-sampling"),
+    pytest.param({"metal_gpu_tree": 0, "subsample": 0.63,
                   "sampling_method": "gradient_based"}, id="gradient-sampling"),
     pytest.param({"metal_gpu_tree": 1, "max_depth": 1}, id="stump"),
 ]
@@ -54,7 +54,7 @@ def test_sampled_multiclass_parallel_trees_keep_compact_group_index():
     X, _ = inputs(rows=513, density=0.65)
     y = (np.arange(len(X)) % 3).astype(np.float32)
     compare(X, y, bins=128, rounds=2,
-            params={"metal_gpu_tree": 1, "objective": "multi:softprob", "num_class": 3,
+            params={"metal_gpu_tree": 0, "objective": "multi:softprob", "num_class": 3,
                     "num_parallel_tree": 2, "subsample": 0.63, "seed_per_iteration": True})
 
 

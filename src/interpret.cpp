@@ -6,12 +6,18 @@
 namespace metalgb {
 void Learner::upload_shap() {
   if (shap_size_ == trees.size()) return;
+  bool rebuild = shap_size_ > trees.size();
+  u32 first = rebuild ? 0u : static_cast<u32>(shap_size_);
+  std::size_t path_base = rebuild ? 0 : shap_path_count_;
+  std::size_t leaf_base = rebuild ? 0 : static_cast<std::size_t>(shap_leaf_count_);
+  std::size_t cat_base = rebuild ? 0 : shap_category_count_;
+  std::size_t mean_base = rebuild ? 0 : shap_mean_count_;
   std::vector<ShapPath> paths;
   std::vector<ShapLeaf> leaves;
   std::vector<u32> categories;
   std::vector<float> means;
   struct Term { ShapPath path; std::vector<u32> categories; };
-  for (u32 tree_id = 0; tree_id < trees.size(); ++tree_id) {
+  for (u32 tree_id = first; tree_id < trees.size(); ++tree_id) {
     auto const& tree = trees[tree_id];
     auto offset = means.size();
     means.resize(offset + tree.nodes.size());
@@ -34,13 +40,13 @@ void Learner::upload_shap() {
       if (node.left < 0) {
         for (u32 target = 0; target < tree.outputs; ++target) {
           float value = tree.outputs > 1 ? tree.leaf_weights.at(std::size_t(node.right) * tree.outputs + target) : node.leaf;
-          leaves.push_back({static_cast<u32>(paths.size()), static_cast<u32>(path.size()),
+          leaves.push_back({static_cast<u32>(path_base + paths.size()), static_cast<u32>(path.size()),
                             tree.outputs > 1 ? target : tree.group, tree.round, value,
                             static_cast<float>(value * probability), tree_id, 0});
         }
         for (auto& term : path) {
-          term.path.category_begin = categories.size();
-          term.path.category_count = term.categories.size();
+          term.path.category_begin = static_cast<u32>(cat_base + categories.size());
+          term.path.category_count = static_cast<u32>(term.categories.size());
           paths.push_back(term.path);
           categories.insert(categories.end(), term.categories.begin(), term.categories.end());
         }
@@ -82,10 +88,20 @@ void Learner::upload_shap() {
     };
     visit(0, {}, 1);
   }
-  shap_paths_ = Buffer(paths.data(), paths.size() * sizeof(ShapPath));
-  shap_leaves_ = Buffer(leaves.data(), leaves.size() * sizeof(ShapLeaf));
-  shap_categories_ = Buffer(categories.data(), categories.size() * sizeof(u32));
-  node_means_ = Buffer(means.data(), means.size() * sizeof(float));
-  shap_leaf_count_ = leaves.size(); shap_size_ = trees.size();
+  auto append_buf = [](Buffer& dst, std::size_t base_count, auto const& src) {
+    using T = typename std::decay_t<decltype(src)>::value_type;
+    std::size_t total = base_count + src.size();
+    dst.reserve(checked_product(total, sizeof(T)), checked_product(base_count, sizeof(T)));
+    if (!src.empty()) std::memcpy(dst.as<T>() + base_count, src.data(), src.size() * sizeof(T));
+  };
+  append_buf(shap_paths_, path_base, paths);
+  append_buf(shap_leaves_, leaf_base, leaves);
+  append_buf(shap_categories_, cat_base, categories);
+  append_buf(node_means_, mean_base, means);
+  shap_path_count_ = path_base + paths.size();
+  shap_category_count_ = cat_base + categories.size();
+  shap_mean_count_ = mean_base + means.size();
+  shap_leaf_count_ = static_cast<u32>(leaf_base + leaves.size());
+  shap_size_ = trees.size();
 }
 }  // namespace metalgb

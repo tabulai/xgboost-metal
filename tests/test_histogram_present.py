@@ -123,7 +123,8 @@ def test_ineligible_paths_keep_complete_histograms(case):
         params["max_cached_hist_node"] = 1
     elif case == "lossguide":
         params.update(grow_policy="lossguide", max_depth=0, max_leaves=7)
-    compare(X, y, bins=bins, rounds=2, params=params, metadata=metadata, expected_active=0)
+    compare(X, y, bins=bins, rounds=2, params=params, metadata=metadata,
+            expected_active=int(case == "sampling"))
 
 
 @pytest.mark.parametrize("kind", ["multiclass", "parallel", "weighted", "column_sample"])

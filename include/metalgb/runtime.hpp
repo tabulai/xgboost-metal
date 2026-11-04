@@ -17,6 +17,14 @@ class Buffer {
   explicit Buffer(std::size_t bytes);
   Buffer(void const* data, std::size_t bytes);
   template <class T> explicit Buffer(std::span<T const> data) : Buffer(data.data(), data.size_bytes()) {}
+  static std::size_t page_size();
+  // Wrap page-aligned host memory zero-copy when possible; falls back to copying.
+  static Buffer view_readonly(void const* data, std::size_t bytes, bool* zero_copied = nullptr);
+  // Wrap the enclosing VM pages of [data, data + bytes) zero-copy for synchronous
+  // read-only GPU kernels, returning the sub-page byte offset into the buffer.
+  static Buffer view_subrange_readonly(void const* data, std::size_t bytes,
+                                       std::size_t& byte_offset, bool* zero_copied = nullptr,
+                                       bool prefer_zero_copy = false);
   [[nodiscard]] void* data() const;
   [[nodiscard]] std::size_t size() const { return bytes_; }
   [[nodiscard]] void* native() const { return object_.get(); }
@@ -45,6 +53,7 @@ class Runtime {
   [[nodiscard]] void* device() const;
   [[nodiscard]] void* queue() const;
   [[nodiscard]] void* pipeline(std::string_view name);
+  static void const* shared_mtl_buffer_contents(void* mtl_buffer);
  private:
   Runtime();
   ~Runtime();

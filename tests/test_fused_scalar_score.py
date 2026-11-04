@@ -115,7 +115,8 @@ def test_unsupported_paths_keep_standalone_helpers(params):
     X, y = inputs(rows=513, density=0.6)
     params = {**params, "metal_fallback_parallel_splits": 0}
     bins = params.pop("max_bin", 32)
-    compare(X, y, bins=bins, params=params, rounds=2, expected_active=0)
+    active = int("monotone_constraints" in params or "subsample" in params)
+    compare(X, y, bins=bins, params=params, rounds=2, expected_active=active)
 
 
 @pytest.mark.parametrize("case", ["multiclass", "parallel", "weighted", "column_sample"])

@@ -27,6 +27,17 @@ float missing_value(Json const& config);
 void require(bool condition, std::string const& message);
 void warning(std::string_view message);
 std::size_t checked_product(std::size_t a, std::size_t b);
+void prefix_sum_u32(Command& command, Buffer const& counts, Buffer const& offsets, u32 n,
+                    std::vector<Buffer>& keepalive);
+
+struct IngestColumnSpec {
+  std::uintptr_t data_ptr{};
+  u32 rows{}, cols{1}, dtype_code{}, mask_mode{kIngestMaskNone};
+  i64 stride_r{}, stride_c{}, data_bit_offset{0};
+  std::uintptr_t mask_ptr{};
+  i64 mask_bit_offset{0};
+  bool prefer_zero_copy{false};
+};
 
 struct Array {
   std::uintptr_t pointer{};
@@ -36,12 +47,15 @@ struct Array {
   std::size_t width{};
   Json mask;
   explicit Array(Json const& description);
+  explicit Array(IngestColumnSpec const& spec);
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] double at(std::size_t row, std::size_t column = 0) const;
   [[nodiscard]] std::vector<float> floats() const;
   void copy_floats(std::span<float> destination) const;
+  [[nodiscard]] IngestColumnSpec to_ingest_spec() const;
  private:
   std::uintptr_t mask_pointer_{};
+  std::size_t mask_bit_offset_{0};
   bool mask_bits_{false};
   [[nodiscard]] bool valid(std::size_t row) const;
 };
@@ -58,12 +72,25 @@ struct CategoryStorage {
   [[nodiscard]] Json array_interfaces();
 };
 
+struct SparseStorage {
+  u32 nnz{0};
+  Buffer csr_row_ptr;   // (rows + 1) * u32
+  Buffer csr_col_idx;   // nnz * u32 (strictly ascending unique column IDs per row)
+  Buffer csr_val;       // nnz * float
+  Buffer csr_bins;      // nnz * u16 or u32 (quantized bins per nonzero)
+  mutable Buffer csc_col_ptr;  // (cols + 1) * u32 (built lazily on GPU)
+  mutable Buffer csc_row_idx;  // nnz * u32 (strictly ascending row IDs per column)
+  mutable Buffer csc_val;      // nnz * float
+};
+
 struct Matrix : std::enable_shared_from_this<Matrix> {
   u32 rows{}, cols{}, label_cols{1};
   std::uint64_t generation{0};
+  bool was_zero_copied{false};
   Buffer data;
-  // Raw CSR is retained for sparse input and binary exchange. Dense training
-  // storage cannot represent repeated entries in the same row and feature.
+  // Native GPU CSR/CSC storage for low-density matrices (avoids rows * cols dense allocation).
+  std::shared_ptr<SparseStorage> sparse_;
+  // Raw CSR is retained for sparse input and binary exchange when duplicates exist.
   std::shared_ptr<SparsePage> sparse_page;
   std::map<std::string, std::vector<float>, std::less<>> info;
   std::array<std::size_t, 2> label_shape{}, margin_shape{};
@@ -88,10 +115,21 @@ struct Matrix : std::enable_shared_from_this<Matrix> {
   Matrix(u32 rows, u32 cols, Buffer values, float missing = kNaN, bool column_major = false);
   static std::shared_ptr<Matrix> dense(Json const& array, float missing);
   static std::shared_ptr<Matrix> columnar(Json const& array, float missing);
+  static std::shared_ptr<Matrix> from_ingest_2d(IngestColumnSpec const& spec, float missing);
+  static std::shared_ptr<Matrix> from_ingest_columns(std::span<IngestColumnSpec const> columns,
+                                                     u32 rows, float missing);
   static std::shared_ptr<Matrix> sparse(Json const& indptr, Json const& indices, Json const& values,
-                                      std::size_t dimension, bool csc, float missing);
+                                      std::size_t dimension, bool csc, float missing,
+                                      int sparse_mode = -1);
+  static std::shared_ptr<Matrix> from_coo(Json const& row_indices, Json const& col_indices,
+                                          Json const& values, std::size_t rows, std::size_t cols,
+                                          float missing, int sparse_mode = -1);
   static std::shared_ptr<Matrix> load_binary(std::string const& filename);
   void save_binary(std::string const& filename) const;
+  [[nodiscard]] bool is_sparse() const noexcept { return static_cast<bool>(sparse_); }
+  [[nodiscard]] Buffer dense_data() const;
+  void ensure_csc() const;
+  void ensure_dense_bins();
   [[nodiscard]] SparsePage raw_csr() const;
   void filter_missing(float missing);
   void set_info(std::string const& field, Array const& values);
@@ -113,12 +151,15 @@ struct Matrix : std::enable_shared_from_this<Matrix> {
   void export_cuts();
   [[nodiscard]] std::shared_ptr<Matrix> slice(std::span<int const> indices, bool allow_groups) const;
   void append(Matrix const& batch);
- private:
   void decode_quantiles(Buffer const& output, bool representative, bool numeric_only = false) const;
+ private:
   bool cuts_categorical_{false}, quantized_types_changed_{false};
-  mutable Buffer partition_data_, partition_bounds_;
+  mutable Buffer partition_data_, partition_bounds_, materialized_dense_;
   mutable Buffer packed_bins_;
   mutable u32 packed_chunk_{0};
+  std::weak_ptr<Matrix const> slice_parent_;
+  Buffer slice_indices_;
+  std::uint64_t slice_parent_generation_{0};
   mutable std::mutex recode_mutex_;
   mutable Json recoded_categories_;
   mutable Buffer recoded_data_;
@@ -140,8 +181,9 @@ struct Prediction { Buffer values; std::vector<std::uint64_t> shape; };
 struct GpuTreeRound {
   Buffer state, flags, history, nodes, meta;
   float eta{0};
-  u32 group{0}, round{0}, node_capacity{0};
-  bool record_paths{true};
+  u32 group{0}, round{0}, node_capacity{0}, batch_index{0};
+  bool record_paths{true}, emit_nodes{true}, root_is_batch_only{false};
+  Buffer unit_mismatch{}, screen_counters{};
   explicit operator bool() const { return static_cast<bool>(state); }
 };
 // Host assembly of a completed GPU-driven tree, shared by both round modes.
@@ -226,7 +268,7 @@ class Learner {
   struct RoundBuffers {
     Buffer gradient, partial, scale, quantized, value_partial, value_scale, value_quantized;
   } round_buffers_;
-  std::vector<Buffer> margin_pool_, round_output_pool_;
+  std::vector<Buffer> margin_pool_, round_output_pool_, metric_pool_;
   Buffer pooled_buffer(std::vector<Buffer>& pool, std::size_t bytes);
   // A committed round. Its GPU outputs stay referenced until retirement, so
   // the output pool cannot hand them out while the host may still read them.
@@ -283,12 +325,16 @@ class Learner {
   void normalize_trees(std::size_t added);
   Buffer shap_paths_, shap_leaves_, shap_categories_, node_means_;
   std::size_t shap_size_{std::numeric_limits<std::size_t>::max()};
+  std::size_t shap_path_count_{0}, shap_category_count_{0}, shap_mean_count_{0};
   u32 shap_leaf_count_{0};
   std::size_t forest_size_{std::numeric_limits<std::size_t>::max()};
   std::size_t forest_node_count_{0}, forest_category_count_{0}, forest_leaf_count_{0};
   std::weak_ptr<Matrix const> validated_matrix_;
   std::uint64_t validated_generation_{0};
   u32 validated_objective_{0}, validated_classes_{0};
+  std::weak_ptr<Matrix const> metric_validated_matrix_;
+  std::uint64_t metric_validated_generation_{0};
+  u32 metric_validated_groups_{0}, metric_validated_mask_{0};
   struct DeferredPrediction {
     // Retain the exact tail-prediction inputs. No command is submitted until a
     // consumer either combines it with gradients or flushes it synchronously.
@@ -296,6 +342,7 @@ class Learner {
     Buffer output;
     PredictParams params;
     u32 rounds;
+    Buffer csr_col_idx{}, csr_val{};
   };
   struct PredictionCache {
     std::weak_ptr<Matrix const> matrix;

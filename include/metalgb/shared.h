@@ -102,9 +102,14 @@ struct HistogramPlanParams { u32 nodes, cols, features, rows_per_tile, subtract,
 // HistogramPlanParams.padding selects tile records and single-owner tags.
 // A tagged HistTask.node is the only task building that histogram slice.
 enum : u32 {
-  kHistogramTileRecords = 1, kHistogramTileMajor = 2, kHistogramPackedShift = 16,
+  kHistogramTileRecords = 1, kHistogramTileMajor = 2, kHistogramCertI32 = 4,
+  kHistogramPackedShift = 16,
   kHistogramPlanTiles = 1, kHistogramPlanSingleOwner = 2,
   kHistogramSingleOwnerTag = 0x80000000u
+};
+struct GradCert {
+  u32 max_g_lo, max_g_hi, or_g_lo, or_g_hi;
+  u32 max_h_lo, max_h_hi, or_h_lo, or_h_hi;
 };
 struct SplitParams {
   u32 nodes, cols, bins, group;
@@ -156,8 +161,15 @@ enum : u32 { kTreeDriverCapacityError = 1, kTreeDriverNodeError = 2 };
 // partition parent. kTreeDriverDenseRoot marks a root whose applied
 // statistics come from select_dense_root_split, not deferred selection.
 // Parallel expansion handles at most kTreeDriverSlots.
-enum : u32 { kTreeDriverParallelSelect = 1, kTreeDriverParallelPlan = 2, kTreeDriverDenseRoot = 4 };
+enum : u32 {
+  kTreeDriverParallelSelect = 1, kTreeDriverParallelPlan = 2, kTreeDriverDenseRoot = 4,
+  kTreeDriverSampledRows = 8, kTreeDriverMonotone = 16
+};
 enum : u32 { kTreeDriverSlots = 512 };
+struct TreeSampleParams {
+  u32 cols, tree_features, level_features, node_features;
+  u32 bylevel, bynode, padding0, padding1;
+};
 // Node-table emission for asynchronous GPU-driven rounds.
 struct TreeEmitParams { float eta; u32 group, round, node_capacity; };
 struct TreeEmitSweepParams { u32 begin, count; float eta; u32 padding; };
@@ -181,6 +193,44 @@ struct MetricParams {
   float parameter, padding2, padding3, padding4;
 };
 struct MetricRatio { float high, low; i32 exponent; u32 valid; };
+enum : u32 { kRadixTileRows = 2048, kAucTileRows = 2048 };
+struct RadixParams { u32 rows, groups, tiles, shift; };
+struct AucTileSummary {
+  u64 total_tp, total_fp;
+  u64 prefix_tp, prefix_fp;
+  u64 suffix_tp, suffix_fp;
+  u32 first_key, last_key, single_run, valid_rows;
+};
+struct AucTilePrefix {
+  u64 excl_tp, excl_fp;
+  u64 carry_tp, carry_fp;
+};
+struct SliceParams { u32 slice_rows, parent_rows, cols, bins; };
+struct SparseParams {
+  u32 rows, cols, nnz, bins;
+  float missing;
+  u32 flags, subtract, targets;
+};
+struct SketchCscParams {
+  u32 rows, cols, nnz, total_tiles;
+  u32 unit_weights, padding0, padding1, padding2;
+};
+enum : u32 {
+  kIngestF32 = 1, kIngestF64 = 2, kIngestF16 = 3, kIngestBF16 = 4,
+  kIngestI8 = 5, kIngestI16 = 6, kIngestI32 = 7, kIngestI64 = 8,
+  kIngestU8 = 9, kIngestU16 = 10, kIngestU32 = 11, kIngestU64 = 12,
+  kIngestBool = 13, kIngestBoolBits = 14
+};
+enum : u32 {
+  kIngestMaskNone = 0, kIngestMaskValidBits = 1, kIngestMaskValidBytes = 2, kIngestMaskInvalidBytes = 3
+};
+struct IngestParams {
+  u32 rows, cols, dtype_code, mask_mode;
+  i64 stride_r, stride_c;
+  i64 data_offset, mask_bit_offset;
+  float missing;
+  u32 block_stride, dst_col_offset, dst_cols;
+};
 
 #ifndef __METAL_VERSION__
 static_assert(sizeof(Node) == 48);
@@ -202,6 +252,12 @@ static_assert(sizeof(QuantileState) == 48);
 static_assert(sizeof(QuantileValueParams) == 20);
 static_assert(sizeof(SketchCutParams) == 32);
 static_assert(sizeof(MetricRatio) == 16);
+static_assert(sizeof(RadixParams) == 16);
+static_assert(sizeof(AucTileSummary) == 64);
+static_assert(sizeof(AucTilePrefix) == 32);
+static_assert(sizeof(SliceParams) == 16);
+static_assert(sizeof(SparseParams) == 32);
+static_assert(sizeof(SketchCscParams) == 32);
 static_assert(sizeof(InitialMean) == 8);
 static_assert(sizeof(SurvivalParams) == 32);
 static_assert(sizeof(CoxScanParams) == 16);
@@ -215,5 +271,8 @@ static_assert(sizeof(TreeDriverParams) == 136);
 static_assert(sizeof(TreeDriverDispatch) == 12);
 static_assert(sizeof(TreeEmitParams) == 16);
 static_assert(sizeof(TreeEmitSweepParams) == 16);
+static_assert(sizeof(GradCert) == 32);
+static_assert(sizeof(TreeSampleParams) == 32);
+static_assert(sizeof(IngestParams) == 64);
 }  // namespace metalgb
 #endif

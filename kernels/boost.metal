@@ -107,6 +107,208 @@ kernel void transpose_columns(device const float* columns [[buffer(0)]],
   }
 }
 
+inline ushort ingest_load_u16(device const uchar* p, ulong off) {
+  if ((off & 1ul) == 0) return *reinterpret_cast<device const ushort*>(p + off);
+  return ushort(p[off]) | (ushort(p[off + 1]) << 8);
+}
+inline uint ingest_load_u32(device const uchar* p, ulong off) {
+  if ((off & 3ul) == 0) return *reinterpret_cast<device const uint*>(p + off);
+  return uint(p[off]) | (uint(p[off + 1]) << 8) | (uint(p[off + 2]) << 16) | (uint(p[off + 3]) << 24);
+}
+inline ulong ingest_load_u64(device const uchar* p, ulong off) {
+  if ((off & 7ul) == 0) return *reinterpret_cast<device const ulong*>(p + off);
+  ulong lo = ingest_load_u32(p, off), hi = ingest_load_u32(p, off + 4);
+  return lo | (hi << 32);
+}
+// Exact IEEE-754 binary64 -> binary32 round-to-nearest-even conversion.
+inline float f64_bits_to_f32(ulong bits) {
+  uint lo = uint(bits), hi = uint(bits >> 32);
+  uint sign = hi & 0x80000000u;
+  int exp64 = int((hi >> 20) & 0x7ffu);
+  uint frac_hi = hi & 0x000fffffu;
+  if (exp64 == 0x7ff) return (frac_hi == 0 && lo == 0) ? as_type<float>(sign | 0x7f800000u) : NAN;
+  if (exp64 == 0) return as_type<float>(sign);  // +-0.0 and all f64 subnormals (< 2^-1022) underflow to +-0.0f
+  int e = exp64 - 1023;
+  if (e > 127) return as_type<float>(sign | 0x7f800000u);
+  ulong sig53 = (ulong(0x00100000u | frac_hi) << 32) | ulong(lo);
+  if (e >= -126) {
+    int exp32 = e + 127;
+    uint mant24 = uint(sig53 >> 29);
+    uint rem29 = uint(sig53) & 0x1fffffffu;
+    if (rem29 > 0x10000000u || (rem29 == 0x10000000u && (mant24 & 1u))) {
+      mant24 += 1u;
+      if (mant24 == 0x01000000u) {
+        mant24 = 0x00800000u;
+        exp32 += 1;
+        if (exp32 >= 255) return as_type<float>(sign | 0x7f800000u);
+      }
+    }
+    return as_type<float>(sign | (uint(exp32) << 23) | (mant24 & 0x007fffffu));
+  }
+  if (e < -150) return as_type<float>(sign);
+  int shift = -97 - e;  // in [30, 53]
+  ulong q = (shift == 53) ? 0ul : (sig53 >> uint(shift));
+  ulong half_bit = 1ul << uint(shift - 1);
+  ulong rem = (shift == 53) ? (sig53 & 0x001ffffffffffffful) : (sig53 & ((half_bit << 1) - 1ul));
+  uint mant = uint(q);
+  if (rem > half_bit || (rem == half_bit && (mant & 1u))) mant += 1u;
+  return as_type<float>(sign | mant);
+}
+inline float ingest_decode_scalar(device const uchar* src, ulong byte_off, uint dtype) {
+  switch (dtype) {
+    case kIngestF32: return as_type<float>(ingest_load_u32(src, byte_off));
+    case kIngestF64: return f64_bits_to_f32(ingest_load_u64(src, byte_off));
+    case kIngestF16: return float(as_type<half>(ingest_load_u16(src, byte_off)));
+    case kIngestBF16: return as_type<float>(uint(ingest_load_u16(src, byte_off)) << 16);
+    case kIngestI8: return float(as_type<char>(src[byte_off]));
+    case kIngestI16: return float(as_type<short>(ingest_load_u16(src, byte_off)));
+    case kIngestI32: return float(as_type<int>(ingest_load_u32(src, byte_off)));
+    case kIngestI64: return float(as_type<long>(ingest_load_u64(src, byte_off)));
+    case kIngestU8: return float(src[byte_off]);
+    case kIngestU16: return float(ingest_load_u16(src, byte_off));
+    case kIngestU32: return float(ingest_load_u32(src, byte_off));
+    case kIngestU64: return float(ingest_load_u64(src, byte_off));
+    case kIngestBool: return float(src[byte_off] != 0);
+    default: return NAN;
+  }
+}
+
+kernel void ingest_contiguous_f32(device const float* src [[buffer(0)]],
+                                  device float* dst [[buffer(1)]],
+                                  device atomic_uint* invalid [[buffer(2)]],
+                                  constant IngestParams& p [[buffer(3)]],
+                                  uint2 block [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+  ulong base = ((ulong(block.y) * p.block_stride + block.x) * 256 + tid) * 4ul;
+  ulong total = ulong(p.rows) * p.cols;
+  ulong src_off = ulong(p.data_offset) >> 2;
+  bool bad = false;
+  for (uint k = 0; k < 4; ++k) {
+    ulong idx = base + k;
+    if (idx < total) {
+      float v = src[src_off + idx];
+      if (fp32_equal(v, p.missing)) v = NAN;
+      else if (isinf(v)) bad = true;
+      dst[idx] = v;
+    }
+  }
+  uint any_bad = simd_sum(uint(bad));
+  if (simd_is_first() && any_bad) atomic_store_explicit(invalid, 1, memory_order_relaxed);
+}
+
+kernel void ingest_contiguous_f64(device const ulong* src [[buffer(0)]],
+                                  device float* dst [[buffer(1)]],
+                                  device atomic_uint* invalid [[buffer(2)]],
+                                  constant IngestParams& p [[buffer(3)]],
+                                  uint2 block [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+  ulong base = ((ulong(block.y) * p.block_stride + block.x) * 256 + tid) * 2ul;
+  ulong total = ulong(p.rows) * p.cols;
+  ulong src_off = ulong(p.data_offset) >> 3;
+  bool bad = false;
+  for (uint k = 0; k < 2; ++k) {
+    ulong idx = base + k;
+    if (idx < total) {
+      float v = f64_bits_to_f32(src[src_off + idx]);
+      if (fp32_equal(v, p.missing)) v = NAN;
+      else if (isinf(v)) bad = true;
+      dst[idx] = v;
+    }
+  }
+  uint any_bad = simd_sum(uint(bad));
+  if (simd_is_first() && any_bad) atomic_store_explicit(invalid, 1, memory_order_relaxed);
+}
+
+kernel void ingest_transpose_f32(device const float* columns [[buffer(0)]],
+                                 device float* data [[buffer(1)]],
+                                 device atomic_uint* invalid [[buffer(2)]],
+                                 constant IngestParams& p [[buffer(3)]],
+                                 uint2 block [[threadgroup_position_in_grid]],
+                                 uint2 lane [[thread_position_in_threadgroup]]) {
+  threadgroup float tile[32][33];
+  ulong tile_index = ulong(block.y) * p.block_stride + block.x;
+  uint row_tiles = uint((ulong(p.rows) + 31) / 32);
+  uint row_begin = uint(tile_index % row_tiles) * 32;
+  ulong column_begin = (tile_index / row_tiles) * 32;
+  if (column_begin >= p.cols) return;
+  ulong src_off = ulong(p.data_offset) >> 2;
+  for (uint j = 0; j < 32; j += 8) {
+    uint row = row_begin + lane.x;
+    ulong column = column_begin + lane.y + j;
+    tile[lane.y + j][lane.x] = row < p.rows && column < p.cols ? columns[src_off + column * p.rows + row] : NAN;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  bool bad = false;
+  for (uint j = 0; j < 32; j += 8) {
+    uint row = row_begin + lane.y + j;
+    ulong column = column_begin + lane.x;
+    if (row < p.rows && column < p.cols) {
+      float value = tile[lane.x][lane.y + j];
+      if (fp32_equal(value, p.missing)) value = NAN;
+      else if (isinf(value)) bad = true;
+      data[ulong(row) * p.cols + column] = value;
+    }
+  }
+  uint any_bad = simd_sum(uint(bad));
+  if (simd_is_first() && any_bad) atomic_store_explicit(invalid, 1, memory_order_relaxed);
+}
+
+kernel void ingest_strided_typed(device const uchar* raw_src [[buffer(0)]],
+                                 device const uchar* mask_src [[buffer(1)]],
+                                 device float* dst [[buffer(2)]],
+                                 device atomic_uint* invalid [[buffer(3)]],
+                                 constant IngestParams& p [[buffer(4)]],
+                                 uint2 block [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+  ulong base = ((ulong(block.y) * p.block_stride + block.x) * 256 + tid) * 4ul;
+  ulong total = ulong(p.rows) * p.cols;
+  bool bad = false;
+  for (uint k = 0; k < 4; ++k) {
+    ulong index = base + k;
+    if (index < total) {
+      uint row, col;
+      if (p.cols == 1u) {
+        row = uint(index);
+        col = 0u;
+      } else if (total <= 0xfffffffful) {
+        uint idx32 = uint(index);
+        row = idx32 / p.cols;
+        col = idx32 % p.cols;
+      } else {
+        row = uint(index / p.cols);
+        col = uint(index % p.cols);
+      }
+      bool valid = true;
+      if (p.mask_mode == kIngestMaskValidBits) {
+        ulong bit_idx = ulong(long(row) + p.mask_bit_offset);
+        valid = (mask_src[bit_idx >> 3] & uchar(1u << (bit_idx & 7ul))) != 0;
+      } else if (p.mask_mode == kIngestMaskValidBytes) {
+        valid = mask_src[ulong(long(row) + p.mask_bit_offset)] != 0;
+      } else if (p.mask_mode == kIngestMaskInvalidBytes) {
+        valid = mask_src[ulong(long(row) + p.mask_bit_offset)] == 0;
+      }
+      float value = NAN;
+      if (valid) {
+        if (p.dtype_code == kIngestF32) {
+          long byte_off = p.data_offset + long(row) * p.stride_r + long(col) * p.stride_c;
+          value = as_type<float>(ingest_load_u32(raw_src, ulong(byte_off)));
+        } else if (p.dtype_code == kIngestBoolBits) {
+          ulong bit_idx = ulong(p.data_offset + long(row));
+          value = float((raw_src[bit_idx >> 3] & uchar(1u << (bit_idx & 7ul))) != 0);
+        } else {
+          long byte_off = p.data_offset + long(row) * p.stride_r + long(col) * p.stride_c;
+          value = ingest_decode_scalar(raw_src, ulong(byte_off), p.dtype_code);
+        }
+        if (fp32_equal(value, p.missing)) value = NAN;
+        else if (isinf(value)) bad = true;
+      }
+      dst[ulong(row) * p.dst_cols + (p.dst_col_offset + col)] = value;
+    }
+  }
+  uint any_bad = simd_sum(uint(bad));
+  if (simd_is_first() && any_bad) atomic_store_explicit(invalid, 1, memory_order_relaxed);
+}
+
 kernel void recode_categories(device const float* input [[buffer(0)]],
                               device const uint2* offsets [[buffer(1)]],
                               device const uint* mapping [[buffer(2)]],
@@ -404,12 +606,54 @@ kernel void quantize_gradients(device const Pair* gradient [[buffer(0)]],
                                device const float2* scales [[buffer(1)]],
                                device long2* output [[buffer(2)]],
                                constant GradientParams& p [[buffer(3)]],
-                               uint2 id [[thread_position_in_grid]]) {
-  if (id.x >= p.rows || id.y >= p.groups) return;
-  ulong index = ulong(id.x) * p.groups + id.y;
-  Pair value = gradient[index];
-  float2 scale = scales[id.y];
-  output[index] = long2(long(rint(value.g * scale.x)), long(rint(value.h * scale.y)));
+                               uint2 block [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+  if (block.y >= p.groups) return;
+  threadgroup uint4 warp_stats[8 * 2];
+  uint row = block.x * 256 + tid;
+  ulong mag_g = 0, or_g = 0, mag_h = 0, or_h = 0;
+  if (row < p.rows) {
+    ulong index = ulong(row) * p.groups + block.y;
+    Pair value = gradient[index];
+    float2 scale = scales[block.y];
+    long qg = long(rint(value.g * scale.x));
+    long qh = long(rint(value.h * scale.y));
+    output[index] = long2(qg, qh);
+    ulong ug = as_type<ulong>(qg), uh = as_type<ulong>(qh);
+    mag_g = qg < 0 ? (0ul - ug) : ug;
+    mag_h = qh < 0 ? (0ul - uh) : uh;
+    or_g = ug;
+    or_h = uh;
+  }
+  uint4 max_lh = simd_max(uint4(uint(mag_g), uint(mag_g >> 32), uint(mag_h), uint(mag_h >> 32)));
+  uint4 or_lh = simd_or(uint4(uint(or_g), uint(or_g >> 32), uint(or_h), uint(or_h >> 32)));
+  if ((tid & 31) == 0) {
+    uint w = (tid >> 5) * 2;
+    warp_stats[w + 0] = max_lh;
+    warp_stats[w + 1] = or_lh;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    uint4 tg_max = uint4(0), tg_or = uint4(0);
+    for (uint w = 0; w < 8; ++w) {
+      tg_max = max(tg_max, warp_stats[w * 2 + 0]);
+      tg_or |= warp_stats[w * 2 + 1];
+    }
+    auto cert = reinterpret_cast<device atomic_uint*>(
+        const_cast<device float2*>(scales) + p.groups) + block.y * 8;
+    if (tg_max.x || tg_max.y) {
+      atomic_fetch_max_explicit(cert + 0, tg_max.x, memory_order_relaxed);
+      atomic_fetch_max_explicit(cert + 1, tg_max.y, memory_order_relaxed);
+      atomic_fetch_or_explicit(cert + 2, tg_or.x, memory_order_relaxed);
+      atomic_fetch_or_explicit(cert + 3, tg_or.y, memory_order_relaxed);
+    }
+    if (tg_max.z || tg_max.w) {
+      atomic_fetch_max_explicit(cert + 4, tg_max.z, memory_order_relaxed);
+      atomic_fetch_max_explicit(cert + 5, tg_max.w, memory_order_relaxed);
+      atomic_fetch_or_explicit(cert + 6, tg_or.z, memory_order_relaxed);
+      atomic_fetch_or_explicit(cert + 7, tg_or.w, memory_order_relaxed);
+    }
+  }
 }
 
 // Generate work from GPU-resident row ranges, so a level can partition and build
@@ -1446,10 +1690,11 @@ kernel void partition_segment_copy(device const uint* source [[buffer(0)]],
   if (index < task.end) destination[index] = source[index];
 }
 
+#include "tree_emit.metal.h"
 #include "tree_driver.metal.h"
 #include "tree_driver_fused.metal.h"
 #include "tree_driver_parallel.metal.h"
-#include "tree_emit.metal.h"
+#include "tree_sample_columns.metal.h"
 
 struct DenseRow {
   device const float* values;
@@ -1466,6 +1711,21 @@ inline uint leaf_index(Row row, device const Node* nodes, uint begin,
   uint node = 0;
   while (nodes[begin + node].left >= 0) {
     Node n = nodes[begin + node];
+    float value = row.get(uint(n.feature));
+    bool numeric_category = n.split_type && category_bounds != nullptr;
+    bool left = split_left(value, numeric_category ? category_bounds[n.feature] : n.threshold,
+                           n.default_left, numeric_category ? 0 : n.split_type,
+                           n.category_begin, n.category_count, categories);
+    node = uint(left ? n.left : n.right);
+  }
+  return node;
+}
+template<class Row>
+inline uint leaf_index_tg(Row row, threadgroup const Node* nodes,
+                          device const uint* categories, device const float* category_bounds = nullptr) {
+  uint node = 0;
+  while (nodes[node].left >= 0) {
+    Node n = nodes[node];
     float value = row.get(uint(n.feature));
     bool numeric_category = n.split_type && category_bounds != nullptr;
     bool left = split_left(value, numeric_category ? category_bounds[n.feature] : n.threshold,
@@ -1500,6 +1760,52 @@ kernel void predict(device const float* data [[buffer(0)]],
     sum += leaf * (p.has_tree_weights ? weights[t] : 1.0f);
   }
   output[idx] = sum;
+}
+// Cooperative threadgroup tree-node caching: loads each shallow/medium tree
+// (<= 256 nodes = 12 KiB SRAM) once per 256-row tile so all 256 rows traverse
+// fast threadgroup SRAM instead of pointer-chasing global memory.
+kernel void predict_tree_cached(device const float* data [[buffer(0)]],
+                                device const Node* nodes [[buffer(1)]],
+                                device const TreeMeta* trees [[buffer(2)]],
+                                device const float* base_score [[buffer(3)]],
+                                device const float* base_margin [[buffer(4)]],
+                                device float* output [[buffer(5)]],
+                                device const uint* categories [[buffer(6)]],
+                                device const float* weights [[buffer(7)]],
+                                device const float* leaf_weights [[buffer(8)]],
+                                device const float* category_bounds [[buffer(9)]],
+                                constant PredictParams& p [[buffer(10)]],
+                                uint2 block [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup Node s_nodes[256];
+  uint row = block.x * 256 + tid, group = block.y;
+  if (group >= p.groups) return;
+  bool valid = row < p.rows;
+  float sum = valid ? (p.has_margin ? base_margin[ulong(row) * p.margin_groups + group] : base_score[group]) : 0.0f;
+  DenseRow row_view{data + (valid ? ulong(row) * p.cols : 0ul)};
+  device const float* cat_bounds = p.bin_partition ? category_bounds : nullptr;
+  for (uint t = p.tree_begin; t < p.trees; ++t) {
+    TreeMeta tree = trees[t];
+    if ((tree.outputs == 1 && tree.group != group) || tree.round < p.begin || tree.round >= p.end) continue;
+    float tw = p.has_tree_weights ? weights[t] : 1.0f;
+    if (tree.count <= 256) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (tid < tree.count) s_nodes[tid] = nodes[tree.begin + tid];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (valid) {
+        uint node = leaf_index_tg(row_view, s_nodes, categories, cat_bounds);
+        float leaf = tree.outputs > 1 ? leaf_weights[tree.leaf_begin + ulong(s_nodes[node].right) * tree.outputs + group]
+                                      : s_nodes[node].leaf;
+        sum += leaf * tw;
+      }
+    } else if (valid) {
+      uint node = leaf_index(row_view, nodes, tree.begin, categories, cat_bounds);
+      float leaf = tree.outputs > 1 ? leaf_weights[tree.leaf_begin + ulong(nodes[tree.begin + node].right) * tree.outputs + group]
+                                    : nodes[tree.begin + node].leaf;
+      sum += leaf * tw;
+    }
+  }
+  if (valid) output[ulong(row) * p.groups + group] = sum;
 }
 // Cooperatively load contiguous rows. Use an odd row stride to avoid the
 // worst bank conflicts at power-of-two feature counts. All lanes reach the
@@ -1649,6 +1955,147 @@ inline float path_one(ShapPath path, float value, device const uint* categories)
   }
   return float(fp32_greater_equal(value, path.lower) && fp32_less(value, path.upper));
 }
+struct SramRow {
+  threadgroup const float* ptr;
+  inline float get(uint f) const { return ptr[f]; }
+};
+
+template<class Row>
+inline void eval_shap_leaf_global(Row row_view, ShapLeaf leaf, float weight, bool interactions,
+                                  ulong columns, device const ShapPath* paths,
+                                  device const uint* categories, device float* dst, bool use_reg_cache) {
+  if (leaf.value == 0.0f || weight == 0.0f || leaf.count == 0) return;
+  if (use_reg_cache && leaf.count <= 32) {
+    uint feat_cache[32];
+    float zero_cache[32];
+    float diff_cache[32];
+    float4 product_lo = leaf.value * kWeightLow, product_hi = leaf.value * kWeightHigh;
+    for (uint i = 0; i < leaf.count; ++i) {
+      ShapPath term = paths[leaf.begin + i];
+      float diff = path_one(term, row_view.get(term.feature), categories) - term.zero;
+      feat_cache[i] = term.feature;
+      zero_cache[i] = term.zero;
+      diff_cache[i] = diff;
+      product_lo *= term.zero + diff * kQuadLow;
+      product_hi *= term.zero + diff * kQuadHigh;
+    }
+    if (!interactions) {
+      for (uint i = 0; i < leaf.count; ++i) {
+        float diff = diff_cache[i];
+        if (diff == 0.0f) continue;
+        float z = zero_cache[i];
+        float4 di_lo = diff / (z + diff * kQuadLow);
+        float4 di_hi = diff / (z + diff * kQuadHigh);
+        dst[feat_cache[i]] += (dot(product_lo, di_lo) + dot(product_hi, di_hi)) * weight;
+      }
+    } else {
+      float4 di_lo_cache[32];
+      float4 di_hi_cache[32];
+      for (uint i = 0; i < leaf.count; ++i) {
+        float diff = diff_cache[i];
+        if (diff == 0.0f) {
+          di_lo_cache[i] = float4(0.0f);
+          di_hi_cache[i] = float4(0.0f);
+          continue;
+        }
+        float z = zero_cache[i];
+        float4 di_lo = diff / (z + diff * kQuadLow);
+        float4 di_hi = diff / (z + diff * kQuadHigh);
+        di_lo_cache[i] = di_lo;
+        di_hi_cache[i] = di_hi;
+        uint fi = feat_cache[i];
+        dst[ulong(fi) * columns + fi] += (dot(product_lo, di_lo) + dot(product_hi, di_hi)) * weight;
+        for (uint j = 0; j < i; ++j) {
+          if (diff_cache[j] == 0.0f) continue;
+          uint fj = feat_cache[j];
+          float interaction = (0.5f * (dot(product_lo * di_lo, di_lo_cache[j]) +
+                                       dot(product_hi * di_hi, di_hi_cache[j]))) * weight;
+          dst[ulong(fi) * columns + fj] += interaction;
+          dst[ulong(fj) * columns + fi] += interaction;
+          dst[ulong(fi) * columns + fi] -= interaction;
+          dst[ulong(fj) * columns + fj] -= interaction;
+        }
+      }
+    }
+    return;
+  }
+  float4 product_lo = leaf.value * kWeightLow, product_hi = leaf.value * kWeightHigh;
+  for (uint i = 0; i < leaf.count; ++i) {
+    ShapPath term = paths[leaf.begin + i];
+    float one = path_one(term, row_view.get(term.feature), categories);
+    product_lo *= term.zero + (one - term.zero) * kQuadLow;
+    product_hi *= term.zero + (one - term.zero) * kQuadHigh;
+  }
+  for (uint i = 0; i < leaf.count; ++i) {
+    ShapPath term = paths[leaf.begin + i];
+    float difference = path_one(term, row_view.get(term.feature), categories) - term.zero;
+    if (difference == 0.0f) continue;
+    float4 di_lo = difference / (term.zero + difference * kQuadLow);
+    float4 di_hi = difference / (term.zero + difference * kQuadHigh);
+    float contribution = dot(product_lo, di_lo) + dot(product_hi, di_hi);
+    ulong index = interactions ? ulong(term.feature) * columns + term.feature : term.feature;
+    dst[index] += contribution * weight;
+    if (interactions) for (uint j = 0; j < i; ++j) {
+      ShapPath partner = paths[leaf.begin + j];
+      float delta = path_one(partner, row_view.get(partner.feature), categories) - partner.zero;
+      if (delta == 0.0f) continue;
+      float4 dj_lo = delta / (partner.zero + delta * kQuadLow);
+      float4 dj_hi = delta / (partner.zero + delta * kQuadHigh);
+      float interaction = (0.5f * (dot(product_lo * di_lo, dj_lo) + dot(product_hi * di_hi, dj_hi))) * weight;
+      dst[ulong(term.feature) * columns + partner.feature] += interaction;
+      dst[ulong(partner.feature) * columns + term.feature] += interaction;
+      dst[ulong(term.feature) * columns + term.feature] -= interaction;
+      dst[ulong(partner.feature) * columns + partner.feature] -= interaction;
+    }
+  }
+}
+
+template<class Row>
+inline void eval_shap_leaf_sram(Row row_view, ShapLeaf leaf, float weight,
+                                device const ShapPath* paths,
+                                device const uint* categories, threadgroup float* s_dst) {
+  if (leaf.value == 0.0f || weight == 0.0f || leaf.count == 0) return;
+  if (leaf.count <= 32) {
+    uint feat_cache[32];
+    float zero_cache[32];
+    float diff_cache[32];
+    float4 product_lo = leaf.value * kWeightLow, product_hi = leaf.value * kWeightHigh;
+    for (uint i = 0; i < leaf.count; ++i) {
+      ShapPath term = paths[leaf.begin + i];
+      float diff = path_one(term, row_view.get(term.feature), categories) - term.zero;
+      feat_cache[i] = term.feature;
+      zero_cache[i] = term.zero;
+      diff_cache[i] = diff;
+      product_lo *= term.zero + diff * kQuadLow;
+      product_hi *= term.zero + diff * kQuadHigh;
+    }
+    for (uint i = 0; i < leaf.count; ++i) {
+      float diff = diff_cache[i];
+      if (diff == 0.0f) continue;
+      float z = zero_cache[i];
+      float4 di_lo = diff / (z + diff * kQuadLow);
+      float4 di_hi = diff / (z + diff * kQuadHigh);
+      s_dst[feat_cache[i]] += (dot(product_lo, di_lo) + dot(product_hi, di_hi)) * weight;
+    }
+    return;
+  }
+  float4 product_lo = leaf.value * kWeightLow, product_hi = leaf.value * kWeightHigh;
+  for (uint i = 0; i < leaf.count; ++i) {
+    ShapPath term = paths[leaf.begin + i];
+    float one = path_one(term, row_view.get(term.feature), categories);
+    product_lo *= term.zero + (one - term.zero) * kQuadLow;
+    product_hi *= term.zero + (one - term.zero) * kQuadHigh;
+  }
+  for (uint i = 0; i < leaf.count; ++i) {
+    ShapPath term = paths[leaf.begin + i];
+    float difference = path_one(term, row_view.get(term.feature), categories) - term.zero;
+    if (difference == 0.0f) continue;
+    float4 di_lo = difference / (term.zero + difference * kQuadLow);
+    float4 di_hi = difference / (term.zero + difference * kQuadHigh);
+    s_dst[term.feature] += (dot(product_lo, di_lo) + dot(product_hi, di_hi)) * weight;
+  }
+}
+
 kernel void shap_contributions(device const float* data [[buffer(0)]],
                                 device const ShapPath* paths [[buffer(1)]],
                                 device const ShapLeaf* leaves [[buffer(2)]],
@@ -1666,41 +2113,60 @@ kernel void shap_contributions(device const float* data [[buffer(0)]],
   ulong offset = (ulong(id.x) * p.groups + id.y) * elements;
   for (ulong i = 0; i < elements; ++i) output[offset + i] = 0;
   float bias = p.has_margin ? margin[ulong(id.x) * p.groups + id.y] : base[id.y];
-  ulong row = ulong(id.x) * p.cols;
+  DenseRow row_view{data + ulong(id.x) * p.cols};
   for (uint leaf_id = 0; leaf_id < p.trees; ++leaf_id) {
     ShapLeaf leaf = leaves[leaf_id];
     if (leaf.group != id.y || leaf.round < p.begin || leaf.round >= p.end) continue;
     float weight = p.has_tree_weights ? weights[leaf.tree] : 1.0f;
     bias += leaf.expectation * weight;
-    float4 product_lo = leaf.value * kWeightLow, product_hi = leaf.value * kWeightHigh;
-    for (uint i = 0; i < leaf.count; ++i) {
-      ShapPath term = paths[leaf.begin + i];
-      float one = path_one(term, data[row + term.feature], categories);
-      product_lo *= term.zero + (one - term.zero) * kQuadLow;
-      product_hi *= term.zero + (one - term.zero) * kQuadHigh;
-    }
-    for (uint i = 0; i < leaf.count; ++i) {
-      ShapPath term = paths[leaf.begin + i];
-      float difference = path_one(term, data[row + term.feature], categories) - term.zero;
-      float4 di_lo = difference / (term.zero + difference * kQuadLow);
-      float4 di_hi = difference / (term.zero + difference * kQuadHigh);
-      float contribution = dot(product_lo, di_lo) + dot(product_hi, di_hi);
-      ulong index = interactions ? ulong(term.feature) * columns + term.feature : term.feature;
-      output[offset + index] += contribution * weight;
-      if (interactions) for (uint j = 0; j < i; ++j) {
-        ShapPath partner = paths[leaf.begin + j];
-        float delta = path_one(partner, data[row + partner.feature], categories) - partner.zero;
-        float4 dj_lo = delta / (partner.zero + delta * kQuadLow);
-        float4 dj_hi = delta / (partner.zero + delta * kQuadHigh);
-        float interaction = (0.5f * (dot(product_lo * di_lo, dj_lo) + dot(product_hi * di_hi, dj_hi))) * weight;
-        output[offset + ulong(term.feature) * columns + partner.feature] += interaction;
-        output[offset + ulong(partner.feature) * columns + term.feature] += interaction;
-        output[offset + ulong(term.feature) * columns + term.feature] -= interaction;
-        output[offset + ulong(partner.feature) * columns + partner.feature] -= interaction;
-      }
-    }
+    eval_shap_leaf_global(row_view, leaf, weight, interactions, columns, paths, categories, output + offset, p.bin_partition != 0);
   }
   output[offset + elements - 1] = bias;
+}
+
+// Coalesced SRAM input+output TreeSHAP for p.cols <= 32 (32 threads/block, 8,448 B SRAM, odd bank stride 33).
+kernel void shap_contributions_fast(device const float* data [[buffer(0)]],
+                                    device const ShapPath* paths [[buffer(1)]],
+                                    device const ShapLeaf* leaves [[buffer(2)]],
+                                    device const float* base [[buffer(3)]],
+                                    device const float* margin [[buffer(4)]],
+                                    device float* output [[buffer(5)]],
+                                    device const uint* categories [[buffer(6)]],
+                                    device const float* weights [[buffer(7)]],
+                                    constant PredictParams& p [[buffer(8)]],
+                                    uint2 block [[threadgroup_position_in_grid]],
+                                    uint lane [[thread_index_in_threadgroup]]) {
+  threadgroup float s_x[32][33];
+  threadgroup float s_out[32][33];
+  uint base_row = block.x * 32, group = block.y;
+  if (group >= p.groups || base_row >= p.rows) return;
+  uint valid_rows = min(32u, p.rows - base_row);
+  for (uint r = 0; r < valid_rows; ++r) {
+    if (lane < p.cols) {
+      s_x[r][lane] = data[ulong(base_row + r) * p.cols + lane];
+      s_out[r][lane] = 0.0f;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane < valid_rows) {
+    uint row = base_row + lane;
+    float bias = p.has_margin ? margin[ulong(row) * p.groups + group] : base[group];
+    SramRow row_view{s_x[lane]};
+    for (uint leaf_id = 0; leaf_id < p.trees; ++leaf_id) {
+      ShapLeaf leaf = leaves[leaf_id];
+      if (leaf.group != group || leaf.round < p.begin || leaf.round >= p.end) continue;
+      float weight = p.has_tree_weights ? weights[leaf.tree] : 1.0f;
+      bias += leaf.expectation * weight;
+      eval_shap_leaf_sram(row_view, leaf, weight, paths, categories, s_out[lane]);
+    }
+    s_out[lane][p.cols] = bias;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint r = 0; r < valid_rows; ++r) {
+    ulong offset = (ulong(base_row + r) * p.groups + group) * (ulong(p.cols) + 1);
+    if (lane < p.cols) output[offset + lane] = s_out[r][lane];
+    if (lane == 0) output[offset + p.cols] = s_out[r][p.cols];
+  }
 }
 kernel void approximate_contributions(device const float* data [[buffer(0)]],
                                       device const Node* nodes [[buffer(1)]],
@@ -1961,3 +2427,7 @@ kernel void stream_copy(device const float4* input [[buffer(0)]],
                         uint index [[thread_position_in_grid]]) {
   if (ulong(index) < count) output[index] = input[index];
 }
+
+#include "radix_sort.metal.h"
+#include "sparse_data.metal.h"
+#include "histogram_csr.metal.h"

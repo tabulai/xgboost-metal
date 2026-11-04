@@ -146,10 +146,8 @@ def test_reachable_constructor_error_then_retry(gradient_fusion):
     ("regression", {"max_depth": 11}),
     ("regression", {"max_leaves": 7}),
     ("regression", {"grow_policy": "lossguide"}),
-    ("regression", {"subsample": 0.7}),
     ("regression", {"max_cached_hist_node": 1}),
     ("regression", {"max_bin": 512}),
-    ("regression", {"monotone_constraints": "(1,0,-1,0,0,0,0)"}),
     ("vector", {}),
     ("categorical", {}),
 ])

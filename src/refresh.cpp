@@ -146,7 +146,7 @@ void Learner::modify_tree(Tree& tree, Matrix const& data, Buffer const& gradient
     auto category_buffer = copy("categories", tree.categories);
     // Like histogram growth, refresh traverses the matrix's stored category
     // codes. Prediction separately maps category names into the model's codes.
-    auto input = data.data;
+    auto input = data.dense_data();
     p.column_major = boolean("metal_refresh_columns", false);
     if (p.column_major && !parents.empty()) {
       auto columns = refresh_buffer("columns", input.size());

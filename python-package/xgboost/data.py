@@ -2,9 +2,12 @@
 # pylint: disable=too-many-return-statements
 """Data dispatching for DMatrix."""
 
+from __future__ import annotations
+
 import ctypes
 import functools
 import json
+import math
 import os
 import warnings
 from typing import (
@@ -21,8 +24,6 @@ from typing import (
     Union,
     cast,
 )
-
-import numpy as np
 
 from ._c_api import _LIB, _check_call, c_str, make_jcargs
 from ._data_utils import (
@@ -45,7 +46,17 @@ from ._data_utils import (
     is_arrow_dict,
     pd_cat_inf,
 )
+from ._metal_array import (
+    MetalArray,
+    XGBufferDescriptor,
+    extract_arrow_capsules,
+    extract_dlpack_capsule,
+    has_dlpack_protocol,
+    is_dlpack_capsule,
+    try_buffer_descriptor,
+)
 from ._typing import (
+    HAS_NUMPY,
     CupyT,
     DataType,
     FeatureNames,
@@ -74,11 +85,18 @@ from .compat import (
     import_pandas,
     import_polars,
     import_pyarrow,
+    is_cupy_available,
     is_pyarrow_available,
     lazy_isinstance,
 )
 
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
+
 if TYPE_CHECKING:
+    import numpy as np
     import pyarrow as pa
     from pandas import DataFrame as PdDataFrame
     from pandas import Series as PdSeries
@@ -98,7 +116,7 @@ _matrix_meta = {"base_margin", "label"}
 
 
 def _warn_unused_missing(data: DataType, missing: Optional[FloatCompatible]) -> None:
-    if (missing is not None) and (not np.isnan(missing)):
+    if (missing is not None) and (not math.isnan(float(missing))):
         warnings.warn(
             "`missing` is not used for current input data type:" + str(type(data)),
             UserWarning,
@@ -111,47 +129,17 @@ def _check_data_shape(data: DataType) -> None:
 
 
 def is_scipy_csr(data: DataType) -> bool:
-    """Predicate for scipy CSR input."""
-    is_array = False
-    is_matrix = False
-    try:
-        from scipy.sparse import csr_array
+    """Predicate for host CSR input (native CSRMatrix, scipy.sparse, or duck-typed)."""
+    from ._sparse import is_sparse_csr
 
-        is_array = isinstance(data, csr_array)
-    except ImportError:
-        pass
-    try:
-        from scipy.sparse import csr_matrix
-
-        is_matrix = isinstance(data, csr_matrix)
-    except ImportError:
-        pass
-    return is_array or is_matrix
+    return is_sparse_csr(data)
 
 
 def transform_scipy_sparse(data: DataType, is_csr: bool) -> DataType:
-    """Ensure correct data alignment and data type for scipy sparse inputs. Input should
-    be either csr or csc matrix.
+    """Ensure correct data alignment and data type for sparse inputs without importing scipy."""
+    from ._sparse import ensure_sparse_aligned
 
-    """
-    from scipy.sparse import csc_matrix, csr_matrix
-
-    if len(data.indices) != len(data.data):
-        raise ValueError(f"length mismatch: {len(data.indices)} vs {len(data.data)}")
-
-    indptr, _ = _ensure_np_dtype(data.indptr, data.indptr.dtype)
-    indices, _ = _ensure_np_dtype(data.indices, data.indices.dtype)
-    values, _ = _ensure_np_dtype(data.data, data.data.dtype)
-    if (
-        indptr is not data.indptr
-        or indices is not data.indices
-        or values is not data.data
-    ):
-        if is_csr:
-            data = csr_matrix((values, indices, indptr), shape=data.shape)
-        else:
-            data = csc_matrix((values, indices, indptr), shape=data.shape)
-    return data
+    return ensure_sparse_aligned(data, is_csr)
 
 
 def _from_scipy_csr(
@@ -183,22 +171,10 @@ def _from_scipy_csr(
 
 
 def is_scipy_csc(data: DataType) -> bool:
-    """Predicate for scipy CSC input."""
-    is_array = False
-    is_matrix = False
-    try:
-        from scipy.sparse import csc_array
+    """Predicate for host CSC input (native CSCMatrix, scipy.sparse, or duck-typed)."""
+    from ._sparse import is_sparse_csc
 
-        is_array = isinstance(data, csc_array)
-    except ImportError:
-        pass
-    try:
-        from scipy.sparse import csc_matrix
-
-        is_matrix = isinstance(data, csc_matrix)
-    except ImportError:
-        pass
-    return is_array or is_matrix
+    return is_sparse_csc(data)
 
 
 def _from_scipy_csc(
@@ -229,30 +205,79 @@ def _from_scipy_csc(
 
 
 def is_scipy_coo(data: DataType) -> bool:
-    """Predicate for scipy COO input."""
-    is_array = False
-    is_matrix = False
-    try:
-        from scipy.sparse import coo_array
+    """Predicate for host COO input (native COOMatrix, scipy.sparse, or duck-typed)."""
+    from ._sparse import is_sparse_coo
 
-        is_array = isinstance(data, coo_array)
-    except ImportError:
-        pass
-    try:
-        from scipy.sparse import coo_matrix
+    return is_sparse_coo(data)
 
-        is_matrix = isinstance(data, coo_matrix)
-    except ImportError:
-        pass
-    return is_array or is_matrix
+
+def _from_scipy_coo(
+    *,
+    data: DataType,
+    missing: FloatCompatible,
+    nthread: int,
+    feature_names: Optional[FeatureNames],
+    feature_types: Optional[FeatureTypes],
+) -> DispatchedDataBackendReturnType:
+    """Initialize data directly from a COO matrix on the Metal GPU."""
+    from ._sparse import ensure_coo_aligned
+
+    handle = ctypes.c_void_p()
+    row, col, values, shape = ensure_coo_aligned(data)
+    _check_call(
+        _LIB.XGDMatrixCreateFromCOO(
+            array_interface(row),
+            array_interface(col),
+            array_interface(values),
+            c_bst_ulong(shape[0]),
+            c_bst_ulong(shape[1]),
+            make_jcargs(
+                missing=float(missing),
+                nthread=int(nthread),
+            ),
+            ctypes.byref(handle),
+        )
+    )
+    return handle, feature_names, feature_types
 
 
 def _is_np_array_like(data: DataType) -> TypeGuard[np.ndarray]:
     return hasattr(data, "__array_interface__")
 
 
-def _maybe_np_slice(data: DataType, dtype: Optional[NumpyDType]) -> np.ndarray:
-    """Handle numpy slice.  This can be removed if we use __array_interface__."""
+def _from_buffer_descriptor(
+    *,
+    desc: XGBufferDescriptor,
+    owner: Any,
+    missing: FloatCompatible,
+    feature_names: Optional[FeatureNames],
+    feature_types: Optional[FeatureTypes],
+) -> DispatchedDataBackendReturnType:
+    """Initialize DMatrix directly from a binary XGBufferDescriptor without JSON."""
+    _ = owner  # Keep underlying buffer owner alive across the C ABI call.
+    handle = ctypes.c_void_p()
+    _check_call(
+        _LIB.XGDMatrixCreateFromBufferDescriptor(
+            ctypes.byref(desc),
+            ctypes.c_float(float(missing)),
+            ctypes.byref(handle),
+        )
+    )
+    return handle, feature_names, feature_types
+
+
+def _maybe_np_slice(data: DataType, dtype: Optional[NumpyDType]) -> Any:
+    """Handle slice indices with or without NumPy."""
+    if isinstance(data, MetalArray) or not HAS_NUMPY or np is None:
+        dt = dtype if dtype is not None else "int32"
+        if isinstance(data, MetalArray):
+            if data.dtype == dt:
+                return data.contiguous()
+            return MetalArray.from_list(data.tolist(), dtype=dt)
+        vals = list(data)
+        if not vals:
+            return MetalArray.empty((0,), dtype=dt)
+        return MetalArray.from_list(vals, dtype=dt)
     try:
         if not data.flags.c_contiguous:
             data = np.array(data, copy=True, dtype=dtype)
@@ -266,14 +291,39 @@ def _maybe_np_slice(data: DataType, dtype: Optional[NumpyDType]) -> np.ndarray:
 
 def _from_numpy_array(
     *,
-    data: np.ndarray,
+    data: Any,
     missing: FloatCompatible,
     nthread: int,
     feature_names: Optional[FeatureNames],
     feature_types: Optional[FeatureTypes],
 ) -> DispatchedDataBackendReturnType:
-    """Initialize data from a 2-D numpy matrix."""
+    """Initialize data from a 2-D numpy matrix or MetalArray."""
     _check_data_shape(data)
+    if isinstance(data, MetalArray):
+        return _from_buffer_descriptor(
+            desc=data.to_descriptor(),
+            owner=data,
+            missing=missing,
+            feature_names=feature_names,
+            feature_types=feature_types,
+        )
+    if (
+        HAS_NUMPY
+        and np is not None
+        and type(data) is np.ndarray
+        and data.dtype.isnative
+        and data.flags.aligned
+        and not array_hasobject(data)
+    ):
+        pep = try_buffer_descriptor(data, allow_1d=False)
+        if pep is not None:
+            return _from_buffer_descriptor(
+                desc=pep[0],
+                owner=pep[1],
+                missing=missing,
+                feature_names=feature_names,
+                feature_types=feature_types,
+            )
     data, _ = _ensure_np_dtype(data, data.dtype)
     handle = ctypes.c_void_p()
     _check_call(
@@ -834,6 +884,32 @@ def _transform_arrow_table(
     return df_t, feature_names, feature_types
 
 
+def _is_arrow_c_exportable(data: DataType) -> bool:
+    """True for Arrow C Data Interface RecordBatch / StructArray / Array objects."""
+    return hasattr(data, "__arrow_c_array__")
+
+
+def _from_arrow_c_interface(
+    data: Any,
+    missing: FloatCompatible,
+    feature_names: Optional[FeatureNames],
+    feature_types: Optional[FeatureTypes],
+) -> DispatchedDataBackendReturnType:
+    """Initialize DMatrix directly from Arrow C Data Interface PyCapsules without JSON."""
+    s_ptr, a_ptr, keepalive = extract_arrow_capsules(data)
+    _ = keepalive
+    handle = ctypes.c_void_p()
+    _check_call(
+        _LIB.XGDMatrixCreateFromArrow(
+            s_ptr,
+            a_ptr,
+            ctypes.c_float(float(missing)),
+            ctypes.byref(handle),
+        )
+    )
+    return handle, feature_names, feature_types
+
+
 def _from_arrow_table(  # pylint: disable=too-many-positional-arguments
     data: DataType,
     enable_categorical: bool,
@@ -842,6 +918,30 @@ def _from_arrow_table(  # pylint: disable=too-many-positional-arguments
     feature_names: Optional[FeatureNames],
     feature_types: Optional[Union[FeatureTypes, Categories]],
 ) -> DispatchedDataBackendReturnType:
+    if TYPE_CHECKING:
+        import pyarrow as pa
+    else:
+        pa = import_pyarrow()
+
+    supported = _arrow_dtype()
+    if (
+        not isinstance(feature_types, Categories)
+        and data.num_rows > 0
+        and data.num_columns > 0
+        and all(col.type in supported for col in data.columns)
+    ):
+        arrays = [
+            col.chunk(0) if col.num_chunks == 1 else col.combine_chunks()
+            for col in data.columns
+        ]
+        rb = pa.RecordBatch.from_arrays(arrays, schema=data.schema)
+        return _from_arrow_c_interface(
+            rb,
+            missing=missing,
+            feature_names=feature_names,
+            feature_types=cast(Optional[FeatureTypes], feature_types),
+        )
+
     df_t, feature_names, feature_types = _transform_arrow_table(
         data, enable_categorical, feature_names, feature_types
     )
@@ -1186,15 +1286,28 @@ def _is_cupy_csc(data: DataType) -> bool:
 
 
 def _is_dlpack(data: DataType) -> bool:
-    return "PyCapsule" in str(type(data)) and "dltensor" in str(data)
+    return is_dlpack_capsule(data)
 
 
-def _transform_dlpack(data: DataType) -> bool:
-    from cupy import from_dlpack  # pylint: disable=E0401
+def _is_cuda_dlpack_obj(data: DataType) -> bool:
+    if hasattr(data, "__dlpack_device__"):
+        try:
+            dev_type, _ = data.__dlpack_device__()
+            return int(dev_type) == 2  # kDLCUDA
+        except Exception:  # pylint: disable=broad-except
+            return False
+    return False
 
-    assert "used_dltensor" not in str(data)
-    data = from_dlpack(data)
-    return data
+
+def _transform_dlpack(data: DataType) -> Any:
+    if is_cupy_available() and (_is_dlpack(data) or _is_cuda_dlpack_obj(data)):
+        from cupy import from_dlpack  # pylint: disable=E0401
+
+        assert "used_dltensor" not in str(data)
+        return from_dlpack(data)
+    if HAS_NUMPY and np is not None and hasattr(data, "__dlpack__"):
+        return np.from_dlpack(data)
+    raise ImportError("CUDA DLPack requires cupy; host/Metal DLPack is handled natively by DMatrix.")
 
 
 def _from_dlpack(
@@ -1204,8 +1317,21 @@ def _from_dlpack(
     feature_names: Optional[FeatureNames],
     feature_types: Optional[FeatureTypes],
 ) -> DispatchedDataBackendReturnType:
-    data = _transform_dlpack(data)
-    return _from_cupy_array(data, missing, nthread, feature_names, feature_types)
+    if _is_cuda_dlpack_obj(data):
+        cuda_arr = _transform_dlpack(data)
+        return _from_cupy_array(cuda_arr, missing, nthread, feature_names, feature_types)
+    ptr, is_ver, keepalive = extract_dlpack_capsule(data)
+    _ = keepalive
+    handle = ctypes.c_void_p()
+    _check_call(
+        _LIB.XGDMatrixCreateFromDLPack(
+            ptr,
+            ctypes.c_int(is_ver),
+            ctypes.c_float(float(missing)),
+            ctypes.byref(handle),
+        )
+    )
+    return handle, feature_names, feature_types
 
 
 def _is_uri(data: DataType) -> TypeGuard[PathLike]:
@@ -1238,8 +1364,18 @@ def _from_list(
     feature_names: Optional[FeatureNames],
     feature_types: Optional[FeatureTypes],
 ) -> DispatchedDataBackendReturnType:
+    if not HAS_NUMPY or np is None:
+        m_arr = MetalArray.from_list(data)
+        _check_data_shape(m_arr)
+        return _from_buffer_descriptor(
+            desc=m_arr.to_descriptor(),
+            owner=m_arr,
+            missing=missing,
+            feature_names=feature_names,
+            feature_types=feature_types,
+        )
     array = np.array(data)
-    _check_data_shape(data)
+    _check_data_shape(array)
     return _from_numpy_array(
         data=array,
         missing=missing,
@@ -1281,15 +1417,15 @@ def _convert_unknown_data(data: DataType) -> DataType:
     )
     try:
         import scipy.sparse
-    except ImportError:
-        return None
 
-    try:
-        data = scipy.sparse.csr_matrix(data)
+        return scipy.sparse.csr_matrix(data)
     except Exception:  # pylint: disable=broad-except
-        return None
+        try:
+            from ._sparse import CSRMatrix
 
-    return data
+            return CSRMatrix(data)
+        except Exception:  # pylint: disable=broad-except
+            return None
 
 
 def dispatch_data_backend(
@@ -1318,6 +1454,16 @@ def dispatch_data_backend(
         and not _is_polars_series(data)
     ):
         _check_data_shape(data)
+    if isinstance(data, MetalArray):
+        _check_data_shape(data)
+        assert check_cats(feature_types)
+        return _from_buffer_descriptor(
+            desc=data.to_descriptor(),
+            owner=data,
+            missing=missing,
+            feature_names=feature_names,
+            feature_types=feature_types,
+        )
     if is_scipy_csr(data):
         assert check_cats(feature_types)
         return _from_scipy_csr(
@@ -1338,8 +1484,8 @@ def dispatch_data_backend(
         )
     if is_scipy_coo(data):
         assert check_cats(feature_types)
-        return _from_scipy_csr(
-            data=data.tocsr(),
+        return _from_scipy_coo(
+            data=data,
             missing=missing,
             nthread=threads,
             feature_names=feature_names,
@@ -1397,6 +1543,14 @@ def dispatch_data_backend(
             feature_names=feature_names,
             feature_types=feature_types,
         )
+    if _is_arrow_c_exportable(data):
+        assert check_cats(feature_types)
+        return _from_arrow_c_interface(
+            data,
+            missing=missing,
+            feature_names=feature_names,
+            feature_types=feature_types,
+        )
     if _is_cudf_pandas(data):
         data = data._fsproxy_fast  # pylint: disable=protected-access
     if _is_pandas_series(data):
@@ -1428,7 +1582,7 @@ def dispatch_data_backend(
         raise TypeError("cupyx CSR is not supported yet.")
     if _is_cupy_csc(data):
         raise TypeError("cupyx CSC is not supported yet.")
-    if _is_dlpack(data):
+    if has_dlpack_protocol(data):
         assert check_cats(feature_types)
         return _from_dlpack(data, missing, threads, feature_names, feature_types)
     if _is_modin_series(data):
@@ -1445,7 +1599,21 @@ def dispatch_data_backend(
             feature_types=feature_types,
         )
 
-    if _has_array_protocol(data):
+    pep = try_buffer_descriptor(data, allow_1d=True)
+    if pep is not None:
+        desc, owner = pep
+        if desc.ndim != 2:
+            raise ValueError("Please reshape the input data into 2-dimensional matrix.")
+        assert check_cats(feature_types)
+        return _from_buffer_descriptor(
+            desc=desc,
+            owner=owner,
+            missing=missing,
+            feature_names=feature_names,
+            feature_types=feature_types,
+        )
+
+    if HAS_NUMPY and np is not None and _has_array_protocol(data):
         assert check_cats(feature_types)
         array = np.asarray(data)
         return _from_numpy_array(
@@ -1484,12 +1652,37 @@ def _validate_meta_shape(data: DataType, name: str) -> None:
             raise ValueError(f"Invalid shape: {data.shape} for {name}")
 
 
+def _meta_from_buffer_descriptor(
+    desc: XGBufferDescriptor,
+    owner: Any,
+    field: str,
+    handle: ctypes.c_void_p,
+) -> None:
+    _ = owner
+    _check_call(_LIB.XGDMatrixSetInfoFromBufferDescriptor(handle, c_str(field), ctypes.byref(desc)))
+
+
 def _meta_from_numpy(
-    data: np.ndarray,
+    data: Any,
     field: str,
     dtype: Optional[NumpyDType],
     handle: ctypes.c_void_p,
 ) -> None:
+    if isinstance(data, MetalArray):
+        _meta_from_buffer_descriptor(data.to_descriptor(), data, field, handle)
+        return
+    if (
+        HAS_NUMPY
+        and np is not None
+        and type(data) is np.ndarray
+        and data.dtype.isnative
+        and data.flags.aligned
+        and not array_hasobject(data)
+    ):
+        pep = try_buffer_descriptor(data, allow_1d=True)
+        if pep is not None:
+            _meta_from_buffer_descriptor(pep[0], pep[1], field, handle)
+            return
     data, dtype = _ensure_np_dtype(data, dtype)
     interface = data.__array_interface__
     if interface.get("mask", None) is not None:
@@ -1501,6 +1694,15 @@ def _meta_from_numpy(
 def _meta_from_list(
     data: Sequence, field: str, dtype: Optional[NumpyDType], handle: ctypes.c_void_p
 ) -> None:
+    if not HAS_NUMPY or np is None:
+        target_dt = "uint32" if field in ("group", "qid") else "float32"
+        m_arr = (
+            MetalArray.from_list(data, dtype=target_dt)
+            if len(data) > 0
+            else MetalArray.empty((0,), dtype=target_dt)
+        )
+        _meta_from_buffer_descriptor(m_arr.to_descriptor(), m_arr, field, handle)
+        return
     data_np = np.array(data)
     _meta_from_numpy(data_np, field, dtype, handle)
 
@@ -1540,6 +1742,9 @@ def dispatch_meta_backend(
     assert handle is not None
     _validate_meta_shape(data, name)
     if data is None:
+        return
+    if isinstance(data, MetalArray):
+        _meta_from_buffer_descriptor(data.to_descriptor(), data, name, handle)
         return
     if _is_list(data):
         _meta_from_list(data, name, dtype, handle)
@@ -1588,7 +1793,11 @@ def dispatch_meta_backend(
         assert len(data.shape) == 1 or data.shape[1] == 0 or data.shape[1] == 1
         _meta_from_numpy(data, name, dtype, handle)
         return
-    if _has_array_protocol(data):
+    pep_meta = try_buffer_descriptor(data, allow_1d=True)
+    if pep_meta is not None:
+        _meta_from_buffer_descriptor(pep_meta[0], pep_meta[1], name, handle)
+        return
+    if HAS_NUMPY and np is not None and _has_array_protocol(data):
         # pyarrow goes here.
         array = np.asarray(data)
         _meta_from_numpy(array, name, dtype, handle)
@@ -1602,6 +1811,8 @@ def _proxy_transform(
     feature_types: Optional[FeatureTypes],
     enable_categorical: bool,
 ) -> TransformedData:
+    if isinstance(data, MetalArray):
+        return data.contiguous(), feature_names, feature_types
     if _is_cudf_pandas(data):
         data = data._fsproxy_fast  # pylint: disable=protected-access
     if _is_cudf_df(data) or _is_cudf_ser(data):
@@ -1614,10 +1825,15 @@ def _proxy_transform(
     if _is_dlpack(data):
         return _transform_dlpack(data), feature_names, feature_types
     if _is_list(data) or _is_tuple(data):
-        data = np.array(data)
+        data = np.array(data) if (HAS_NUMPY and np is not None) else MetalArray.from_list(data)
     if _is_np_array_like(data):
         data, _ = _ensure_np_dtype(data, data.dtype)
         return data, feature_names, feature_types
+    if not HAS_NUMPY or np is None:
+        pep_proxy = try_buffer_descriptor(data, allow_1d=False)
+        if pep_proxy is not None:
+            m_buf = MetalArray.from_buffer(data)
+            return m_buf, feature_names, feature_types
     if is_scipy_csr(data):
         data = transform_scipy_sparse(data, True)
         return data, feature_names, feature_types

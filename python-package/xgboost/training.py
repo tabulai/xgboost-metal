@@ -3,7 +3,9 @@
 """Training Library containing training routines."""
 
 import copy
+import ctypes
 import os
+import random
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -18,9 +20,8 @@ from typing import (
     cast,
 )
 
-import numpy as np
-
-from ._typing import BoosterParam, Callable, FPreProcCallable
+from ._c_api import _LIB, _check_call
+from ._typing import HAS_NUMPY, BoosterParam, Callable, FPreProcCallable
 from .callback import (
     CallbackContainer,
     EarlyStopping,
@@ -38,7 +39,13 @@ from .core import (
     _RefMixIn,
 )
 
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
+
 if TYPE_CHECKING:
+    import numpy as _np
     from pandas import DataFrame as PdDataFrame
 
 _CVFolds = Sequence["CVPack"]
@@ -294,14 +301,20 @@ class _PackedBooster:
         self.set_attr(best_score=score)
 
 
-def groups_to_rows(groups: np.ndarray, boundaries: np.ndarray) -> np.ndarray:
+def groups_to_rows(groups: Any, boundaries: Any) -> Any:
     """
     Given group row boundaries, convert ground indexes to row indexes
     :param groups: list of groups for testing
     :param boundaries: rows index limits of each group
     :return: row in group
     """
-    return np.concatenate([np.arange(boundaries[g], boundaries[g + 1]) for g in groups])
+    if HAS_NUMPY and np is not None:
+        return np.concatenate([np.arange(boundaries[g], boundaries[g + 1]) for g in groups])
+    rows: List[int] = []
+    b_list = boundaries.tolist() if hasattr(boundaries, "tolist") else list(boundaries)
+    for g in groups:
+        rows.extend(range(int(b_list[g]), int(b_list[g + 1])))
+    return rows
 
 
 def mkgroupfold(
@@ -317,42 +330,31 @@ def mkgroupfold(
     Make n folds for cross-validation maintaining groups
     :return: cross-validation folds
     """
-    # we have groups for pairwise ranking... get a list of the group indexes
-    group_boundaries = dall.get_uint_info("group_ptr")
-    group_sizes = np.diff(group_boundaries)
-
-    if shuffle is True:
-        idx = np.random.permutation(len(group_sizes))
-    else:
-        idx = np.arange(len(group_sizes))
-    # list by fold of test group indexes
-    out_group_idset = np.array_split(idx, nfold)
-    # list by fold of train group indexes
-    in_group_idset = [
-        np.concatenate([out_group_idset[i] for i in range(nfold) if k != i])
+    c_train = (ctypes.c_void_p * nfold)()
+    c_test = (ctypes.c_void_p * nfold)()
+    seed_val = random.randint(0, 0x7FFFFFFF) if shuffle else 0
+    _check_call(
+        _LIB.XGDMatrixBuildCVFolds(
+            dall.handle,
+            ctypes.c_int(nfold),
+            ctypes.c_uint(seed_val),
+            ctypes.c_int(1 if shuffle else 0),
+            ctypes.c_int(0),
+            c_train,
+            c_test,
+        )
+    )
+    fold_pairs = [
+        (DMatrix(ctypes.c_void_p(c_train[k])), DMatrix(ctypes.c_void_p(c_test[k])))
         for k in range(nfold)
     ]
-    # from the group indexes, convert them to row indexes
-    in_idset = [
-        groups_to_rows(in_groups, group_boundaries) for in_groups in in_group_idset
-    ]
-    out_idset = [
-        groups_to_rows(out_groups, group_boundaries) for out_groups in out_group_idset
-    ]
-
-    # build the folds by taking the appropriate slices
     ret = []
-    for k in range(nfold):
-        # perform the slicing using the indexes determined by the above methods
-        dtrain = dall.slice(in_idset[k], allow_groups=True)
-        dtrain.set_group(group_sizes[in_group_idset[k]])
-        dtest = dall.slice(out_idset[k], allow_groups=True)
-        dtest.set_group(group_sizes[out_group_idset[k]])
-        # run preprocessing on the data set if needed
+    param_dict = dict(param) if not isinstance(param, dict) else param
+    for dtrain, dtest in fold_pairs:
         if fpreproc is not None:
-            dtrain, dtest, tparam = fpreproc(dtrain, dtest, param.copy())
+            dtrain, dtest, tparam = fpreproc(dtrain, dtest, param_dict.copy())
         else:
-            tparam = param
+            tparam = param_dict
         plst = list(tparam.items()) + [("eval_metric", itm) for itm in evals]
         ret.append(CVPack(dtrain, dtest, plst))
     return ret
@@ -374,47 +376,47 @@ def mknfold(
     Make an n-fold list of CVPack from random indices.
     """
     evals = list(evals)
-    np.random.seed(seed)
+    if HAS_NUMPY and np is not None:
+        np.random.seed(seed)
 
-    if stratified is False and folds is None:
-        # Do standard k-fold cross validation. Automatically determine the folds.
-        if len(dall.get_uint_info("group_ptr")) > 1:
-            return mkgroupfold(
-                dall=dall,
-                nfold=nfold,
-                param=param,
-                evals=evals,
-                fpreproc=fpreproc,
-                shuffle=shuffle,
+    if folds is None:
+        c_train = (ctypes.c_void_p * nfold)()
+        c_test = (ctypes.c_void_p * nfold)()
+        _check_call(
+            _LIB.XGDMatrixBuildCVFolds(
+                dall.handle,
+                ctypes.c_int(nfold),
+                ctypes.c_uint(int(seed) & 0xFFFFFFFF),
+                ctypes.c_int(1 if shuffle else 0),
+                ctypes.c_int(1 if stratified else 0),
+                c_train,
+                c_test,
             )
-
-        if shuffle is True:
-            idx = np.random.permutation(dall.num_row())
-        else:
-            idx = np.arange(dall.num_row())
-        out_idset = np.array_split(idx, nfold)
-        in_idset = [
-            np.concatenate([out_idset[i] for i in range(nfold) if k != i])
+        )
+        fold_pairs = [
+            (DMatrix(ctypes.c_void_p(c_train[k])), DMatrix(ctypes.c_void_p(c_test[k])))
             for k in range(nfold)
         ]
-    elif folds is not None:
-        # Use user specified custom split using indices
-        try:
-            in_idset = [x[0] for x in folds]
-            out_idset = [x[1] for x in folds]
-        except TypeError:
-            # Custom stratification using Sklearn KFoldSplit object
-            splits = list(folds.split(X=dall.get_label(), y=dall.get_label()))
-            in_idset = [x[0] for x in splits]
-            out_idset = [x[1] for x in splits]
-        nfold = len(out_idset)
-    else:
-        # Do standard stratefied shuffle k-fold split
-        sfk = XGBStratifiedKFold(n_splits=nfold, shuffle=True, random_state=seed)
-        splits = list(sfk.split(X=dall.get_label(), y=dall.get_label()))
+        ret = []
+        param_dict = dict(param) if not isinstance(param, dict) else param
+        for dtrain, dtest in fold_pairs:
+            if fpreproc is not None:
+                dtrain, dtest, tparam = fpreproc(dtrain, dtest, param_dict.copy())
+            else:
+                tparam = param_dict
+            plst = list(tparam.items()) + [("eval_metric", itm) for itm in evals]
+            ret.append(CVPack(dtrain, dtest, plst))
+        return ret
+
+    # Use user specified custom split using indices or Sklearn splitter object
+    try:
+        in_idset = [x[0] for x in folds]
+        out_idset = [x[1] for x in folds]
+    except TypeError:
+        splits = list(folds.split(X=dall.get_label(), y=dall.get_label()))
         in_idset = [x[0] for x in splits]
         out_idset = [x[1] for x in splits]
-        nfold = len(out_idset)
+    nfold = len(out_idset)
 
     ret = []
     for k in range(nfold):
@@ -539,10 +541,6 @@ def cv(
     -------
     evaluation history : list(string)
     """
-    if stratified is True and not SKLEARN_INSTALLED:
-        raise XGBoostError(
-            "sklearn needs to be installed in order to use stratified cv"
-        )
     if isinstance(metrics, str):
         metrics = [metrics]
     if isinstance(dtrain, _RefMixIn):

@@ -13,16 +13,20 @@ import warnings
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple
 
-import numpy as np
-
 from ._data_utils import (
     _ensure_np_dtype,
     _is_flatten,
     array_interface,
     cuda_array_interface,
 )
-from ._typing import ArrayLike, NumpyOrCupy
+from ._metal_array import MetalArray
+from ._typing import HAS_NUMPY, ArrayLike, NumpyOrCupy
 from .compat import _is_cupy_alike
+
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     from .core import DMatrix
@@ -67,10 +71,12 @@ class TreeObjective(Objective):
 def _grad_arrinf(array: NumpyOrCupy, n_samples: int) -> bytes:
     # Can we check for __array_interface__ instead of a specific type instead?
     msg = (
-        "Expecting `np.ndarray` or `cupy.ndarray` for gradient and hessian."
+        "Expecting `np.ndarray`, `MetalArray`, or `cupy.ndarray` for gradient and hessian."
         f" Got: {type(array)}"
     )
-    if not isinstance(array, np.ndarray) and not _is_cupy_alike(array):
+    is_np = HAS_NUMPY and np is not None and isinstance(array, np.ndarray)
+    is_metal = isinstance(array, MetalArray)
+    if not is_np and not is_metal and not _is_cupy_alike(array):
         raise TypeError(msg)
 
     if array.shape[0] != n_samples and _is_flatten(array):
@@ -81,9 +87,11 @@ def _grad_arrinf(array: NumpyOrCupy, n_samples: int) -> bytes:
         )
         array = array.reshape(n_samples, array.size // n_samples)
 
-    if isinstance(array, np.ndarray):
+    if is_np:
         array, _ = _ensure_np_dtype(array, array.dtype)
         interface = array_interface(array)
+    elif is_metal:
+        interface = array_interface(array.contiguous())
     elif _is_cupy_alike(array):
         interface = cuda_array_interface(array)
     else:

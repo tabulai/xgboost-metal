@@ -259,8 +259,6 @@ def test_stale_flags_workspace_reuse_and_runtime_toggles(workspace, persistent):
     ("regression", {"max_depth": 11}),
     ("regression", {"max_leaves": 7}),
     ("regression", {"grow_policy": "lossguide"}),
-    ("regression", {"subsample": 0.7}),
-    ("regression", {"monotone_constraints": "(1,0,-1,0,0,0,0)"}),
     ("vector", {}),
     ("categorical", {}),
 ])

@@ -19,7 +19,13 @@ from typing import (
     Union,
 )
 
-import numpy as np
+try:
+    import numpy as np
+
+    HAS_NUMPY = True
+except ImportError:  # pragma: no cover - zero-NumPy environments
+    np = None  # type: ignore[assignment]
+    HAS_NUMPY = False
 
 DataType = Any
 
@@ -30,6 +36,7 @@ BoosterParam = Union[List, Dict[str, Any]]  # better be sequence
 
 ArrayLike = Any
 if TYPE_CHECKING:
+    import numpy as _np
     import pyarrow as pa
 
     PathLike = Union[str, os.PathLike[str]]
@@ -40,15 +47,20 @@ ArrowCatCol: TypeAlias = Optional[Union["pa.StringArray", "pa.NumericArray"]]
 ArrowCatList: TypeAlias = List[Tuple[str, Optional[ArrowCatCol]]]
 
 CupyT = ArrayLike  # maybe need a stub for cupy arrays
-NumpyOrCupy = Union[np.ndarray, Any]
-NumpyDType = Union[str, Type[np.number], np.dtype[Any]]
+if HAS_NUMPY and np is not None:
+    NumpyOrCupy = Union[np.ndarray, Any]
+    NumpyDType = Union[str, Type[np.number], np.dtype[Any]]
+    FloatCompatible = Union[float, np.float32, np.float64]
+    # typing.SupportsInt is not suitable here since floating point values are convertible to
+    # integers as well.
+    Integer = Union[int, np.integer]
+else:
+    NumpyOrCupy = Any
+    NumpyDType = Any
+    FloatCompatible = float  # type: ignore[misc]
+    Integer = int  # type: ignore[misc]
+
 PandasDType = Any  # real type is pandas.core.dtypes.base.ExtensionDtype
-
-FloatCompatible = Union[float, np.float32, np.float64]
-
-# typing.SupportsInt is not suitable here since floating point values are convertible to
-# integers as well.
-Integer = Union[int, np.integer]
 IterationRange = Tuple[Integer, Integer]
 
 # callables

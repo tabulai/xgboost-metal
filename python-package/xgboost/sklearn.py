@@ -27,7 +27,6 @@ from typing import (
 )
 
 import numpy as np
-from scipy.special import expit, softmax
 
 from ._c_api import _parse_version, _py_version
 from ._data_utils import Categories
@@ -1927,34 +1926,43 @@ class XGBClassifier(XGBClassifierMixIn, XGBModel):
             probability of each data example being of a given class.
 
         """
-        # custom obj:      Do nothing as we don't know what to do.
-        # softprob:        Do nothing, output is proba.
-        # softmax:         Use softmax from scipy
-        # binary:logistic: Expand the prob vector into 2-class matrix after predict.
-        # binary:logitraw: Apply the sigmoid to the raw margin, then expand the same
-        #                  way as binary:logistic.
-        if self.objective == "multi:softmax":
-            raw_predt = super().predict(
-                X=X,
-                validate_features=validate_features,
+        # Fused Metal GPU probability path (no scipy.special dependency):
+        # - multi:softmax / multi:softprob: GPU softmax without argmax
+        # - binary:logistic / binary:logitraw / binary:hinge / custom: GPU [1 - p, p]
+        # - multi-label binary:logitraw: GPU elementwise sigmoid
+        with config_context(verbosity=self.verbosity):
+            iteration_range = self._get_iteration_range(iteration_range)
+            if self._can_use_inplace_predict():
+                try:
+                    predts = self.get_booster().inplace_predict(
+                        data=X,
+                        iteration_range=iteration_range,
+                        predict_type="proba",
+                        missing=self.missing,
+                        base_margin=base_margin,
+                        validate_features=validate_features,
+                    )
+                    if _is_cupy_alike(predts):
+                        cp = import_cupy()
+                        predts = cp.asnumpy(predts)
+                    return predts
+                except TypeError:
+                    pass
+
+            test = DMatrix(
+                X,
                 base_margin=base_margin,
-                iteration_range=iteration_range,
-                output_margin=True,
+                missing=self.missing,
+                nthread=self.n_jobs,
+                feature_types=self.feature_types,
+                enable_categorical=self.enable_categorical,
             )
-            class_prob = softmax(raw_predt, axis=1)
-            return class_prob
-        class_probs = super().predict(
-            X=X,
-            validate_features=validate_features,
-            base_margin=base_margin,
-            iteration_range=iteration_range,
-        )
-        if self.objective == "binary:logitraw":
-            # `binary:logitraw` outputs the raw margin instead of a probability, so it
-            # needs to be transformed into a probability before it can be expanded into
-            # a 2-class matrix.
-            class_probs = expit(class_probs)
-        return _cls_predict_proba(self.n_classes_, class_probs, np.vstack)
+            return self.get_booster().predict(
+                data=test,
+                iteration_range=iteration_range,
+                validate_features=validate_features,
+                _metal_proba=True,
+            )
 
 
 @xgboost_model_doc(

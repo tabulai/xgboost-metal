@@ -133,7 +133,8 @@ def test_unsupported_paths_keep_the_original_subtraction(case):
         params["subsample"] = 0.7
     else:
         params["metal_histogram_subtraction"] = 0
-    compare(X, y, bins=bins, params=params, metadata=metadata, expected_active=0, rounds=2)
+    compare(X, y, bins=bins, params=params, metadata=metadata,
+            expected_active=int(case in ("monotone", "sampling")), rounds=2)
 
 
 @pytest.mark.parametrize("depth,pruned", list(itertools.product([8, 9, 10], [False, True])))

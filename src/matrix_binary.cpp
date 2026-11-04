@@ -83,15 +83,49 @@ std::shared_ptr<Matrix> Matrix::load_binary(std::string const& filename) {
   auto matrix = std::make_shared<Matrix>();
   matrix->rows = document.rows; matrix->cols = document.columns;
   auto elements = checked_product(matrix->rows, matrix->cols);
-  matrix->data = Buffer(checked_product(elements, sizeof(float)));
-  std::fill_n(matrix->data.as<float>(), elements, kNaN);
-  for (u32 row = 0; row < matrix->rows; ++row) {
-    for (auto i = document.offsets[row]; i < document.offsets[row + 1]; ++i) {
-      auto entry = document.entries[i];
-      if (!std::isnan(entry.value)) matrix->data.as<float>()[static_cast<std::size_t>(row) * matrix->cols + entry.feature] = entry.value;
+  auto raw_nnz = document.entries.size();
+  if (matrix->rows > 0 && matrix->cols > 0 && raw_nnz <= 0x7fffffffu &&
+      elements >= 16384 && matrix->cols >= 16 && raw_nnz < elements / 4) {
+    auto storage = std::make_shared<SparseStorage>();
+    storage->csr_row_ptr = Buffer((static_cast<std::size_t>(matrix->rows) + 1) * sizeof(u32));
+    auto* rp = storage->csr_row_ptr.as<u32>();
+    std::vector<u32> cols_vec;
+    std::vector<float> vals_vec;
+    cols_vec.reserve(raw_nnz);
+    vals_vec.reserve(raw_nnz);
+    rp[0] = 0;
+    for (u32 row = 0; row < matrix->rows; ++row) {
+      auto begin = document.offsets[row], end = document.offsets[row + 1];
+      for (auto i = begin; i < end; ++i) {
+        auto entry = document.entries[i];
+        if (std::isnan(entry.value)) continue;
+        // Binary CSR entries in a row are sorted by feature; if duplicate features appear, last write wins.
+        if (!cols_vec.empty() && cols_vec.size() > rp[row] && cols_vec.back() == entry.feature) {
+          vals_vec.back() = entry.value;
+        } else {
+          cols_vec.push_back(entry.feature);
+          vals_vec.push_back(entry.value);
+        }
+      }
+      rp[row + 1] = static_cast<u32>(cols_vec.size());
     }
+    storage->nnz = static_cast<u32>(cols_vec.size());
+    storage->csr_col_idx = Buffer(cols_vec.data(), cols_vec.size() * sizeof(u32));
+    storage->csr_val = Buffer(vals_vec.data(), vals_vec.size() * sizeof(float));
+    matrix->data = {};
+    matrix->sparse_ = std::move(storage);
+    matrix->sparse_page = std::make_shared<SparsePage>(SparsePage{std::move(document.offsets), std::move(document.entries)});
+  } else {
+    matrix->data = Buffer(checked_product(elements, sizeof(float)));
+    std::fill_n(matrix->data.as<float>(), elements, kNaN);
+    for (u32 row = 0; row < matrix->rows; ++row) {
+      for (auto i = document.offsets[row]; i < document.offsets[row + 1]; ++i) {
+        auto entry = document.entries[i];
+        if (!std::isnan(entry.value)) matrix->data.as<float>()[static_cast<std::size_t>(row) * matrix->cols + entry.feature] = entry.value;
+      }
+    }
+    matrix->sparse_page = std::make_shared<SparsePage>(SparsePage{std::move(document.offsets), std::move(document.entries)});
   }
-  matrix->sparse_page = std::make_shared<SparsePage>(SparsePage{std::move(document.offsets), std::move(document.entries)});
   matrix->label_shape = {document.labels.shape[0], document.labels.shape[1]};
   matrix->margin_shape = {document.margins.shape[0], document.margins.shape[1]};
   matrix->label_cols = std::max<std::size_t>(matrix->label_shape[1], 1);

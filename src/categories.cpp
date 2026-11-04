@@ -214,7 +214,7 @@ Buffer Matrix::data_for_categories(Json const& reference) const {
   if (!has_categories(reference) || !has_categories(categories) || reference == categories) return data;
   std::lock_guard lock(recode_mutex_);
   if (recoded_data_ && recoded_generation_ == generation && recoded_categories_ == reference) return recoded_data_;
-  auto output = recode_values(data, rows, cols, categories, reference, false, false);
+  auto output = recode_values(dense_data(), rows, cols, categories, reference, false, false);
   recoded_categories_ = reference; recoded_generation_ = generation; recoded_data_ = output;
   return output;
 }

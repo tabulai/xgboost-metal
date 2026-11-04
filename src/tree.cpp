@@ -161,9 +161,11 @@ class TreeBuilder {
     auto limit = std::stoull(cache, &read);
     require(read == cache.size() && limit > 0, "max_cached_hist_node must be a positive integer.");
     cache_limit_ = limit == UINT64_MAX ? 4096 : limit;
+    bool shared_init = learner.has_inflight_rounds() ||
+                       (async_round && !async_round->emit_nodes && async_round->batch_index > 0);
     monotone_ = monotone_constraints(learner.str("monotone_constraints"), data.cols);
     monotone_buffer_ = fixed_workspace_ ?
-        workspace_.copy_input(monotone_, constant_inputs_, learner.has_inflight_rounds()) : upload(monotone_);
+        workspace_.copy_input(monotone_, constant_inputs_, shared_init) : upload(monotone_);
     if (vector_) {
       tree_.outputs = outputs; tree_.split_outputs = targets_;
       tree_.base_weights.resize(targets_);
@@ -222,19 +224,26 @@ class TreeBuilder {
     }
     split_skip_empty_bins_ = learner.integer("metal_skip_empty_bins", 1) != 0 &&
                              !data.quantized_dense && !vector_ && parallel_splits_ && scalar_tiles_ == 1;
+    sparse_pipeline_ = data.is_sparse() && data.cols > 0 && histogram_missing_;
+    if (data.is_sparse() && !histogram_missing_) data.ensure_dense_bins();
     bool large = data.rows >= 262144 && data.cols >= 32;
-    rows_per_tile_ = learner.integer("metal_histogram_rows", large ? 4096 : 2048);
+    rows_per_tile_ = learner.integer("metal_histogram_rows", sparse_pipeline_ ? 256 : (large ? 4096 : 2048));
     // Packed uint8 bins serve four features with one 4-byte load, so dense
     // numeric inputs beyond a few row tiles also group four features. Lossguide
     // trees never use packed bins; their small nodes favor ungrouped histograms.
     bool packed_grouping = data.quantized_dense && !vector_ && !has_categories_ && !lossguide_ &&
                            data.rows >= 16384 &&
                            learner.integer("metal_histogram_packed_bins", 16) != 0;
-    auto feature_group = data.histogram_bins <= 256 ?
-        (large || packed_grouping ? 4 : !data.quantized_dense && !vector_ && !has_categories_ ? 2 : 1) : 1;
+    auto feature_group = sparse_pipeline_ ? 1 : (data.histogram_bins <= 256 ?
+        (packed_grouping && data.cols >= 32 && data.histogram_bins <= 128 ? 8 :
+         large || packed_grouping ? 4 :
+         !data.quantized_dense && !vector_ && !has_categories_ ? 2 : 1) : 1);
     features_per_group_ = learner.integer("metal_features_per_group", feature_group);
-    require(features_per_group_ >= 1 && features_per_group_ <= 4, "metal_features_per_group must be in [1, 4].");
-    if (static_cast<std::size_t>(data.histogram_bins) * features_per_group_ > 1024) features_per_group_ = 1;
+    require(features_per_group_ >= 1 && features_per_group_ <= 8, "metal_features_per_group must be in [1, 8].");
+    if (data.histogram_bins > 256 || !(data.quantized_dense || histogram_missing_)) {
+      features_per_group_ = std::min(features_per_group_, 4u);
+      if (static_cast<std::size_t>(data.histogram_bins) * features_per_group_ > 1024) features_per_group_ = 1;
+    }
     require(rows_per_tile_ >= 256 && rows_per_tile_ <= 16384 && rows_per_tile_ % 256 == 0,
             "metal_histogram_rows must be a multiple of 256 in [256, 16384].");
     histogram_words_ = checked_product(checked_product(targets_, data.cols), (static_cast<std::size_t>(data.histogram_bins) + 1) * 4);
@@ -247,11 +256,12 @@ class TreeBuilder {
                             {"tree_workspace", learner.integer("metal_tree_workspace", 1)},
                             {"tree_fixed_workspace", fixed_workspace_},
                             {"histogram_missing", histogram_missing_},
+                            {"sparse_pipeline", sparse_pipeline_},
                             {"split_skip_empty_bins", split_skip_empty_bins_},
                             {"tree_control_fusion", 0}, {"fused_subtraction", 0}, {"fast_weight", 0}, {"fast_gain", 0},
                             {"histogram_present", 0}, {"histogram_compact_scratch", 0}, {"histogram_clear_built", 0},
                             {"histogram_schedule", 0}, {"histogram_single_owner", 0}, {"histogram_packed_bins", 0},
-                            {"histogram_unit_hessian", 0},
+                            {"histogram_unit_hessian", 0}, {"histogram_i32", 0},
                             {"split_threads", 32}, {"fast_stats", 0}, {"compact_splits", 0}, {"parallel_root", 0}, {"fused_score", 0},
                             {"fallback_parallel_root", 0}, {"fallback_parallel_splits", 0},
                             {"gpu_tree", 0}, {"gpu_tree_levels", 0}, {"gpu_tree_scratch_bytes", 0},
@@ -279,9 +289,16 @@ class TreeBuilder {
 
   Tree grow() {
     if (gpu_tree_eligible()) {
-      if (!gpu_row_init_) initialize_rows();
+      if (!gpu_row_init_ && !compact_) initialize_rows();
       return grow_on_gpu();
     }
+    if (features_per_group_ > 4 || static_cast<std::size_t>(data_.histogram_bins) * features_per_group_ > 1024) {
+      features_per_group_ = std::min(features_per_group_, 4u);
+      if (static_cast<std::size_t>(data_.histogram_bins) * features_per_group_ > 1024) features_per_group_ = 1;
+      hp_.padding0 = features_per_group_;
+      learner_.active_tuning["features_per_group"] = features_per_group_;
+    }
+    if (async_round_ && async_round_->root_is_batch_only) root_command_ = nullptr;
     // Host-driven trees store into retained workspace between waits. Retire
     // committed asynchronous rounds before the first such store.
     if (learner_.has_inflight_rounds()) learner_.drain();
@@ -334,7 +351,9 @@ class TreeBuilder {
   // Host row identities. A retained slot that a committed asynchronous round
   // may still read is replaced rather than overwritten.
   void initialize_rows() {
-    if (fixed_workspace_ && !learner_.has_inflight_rounds()) {
+    bool shared = learner_.has_inflight_rounds() ||
+                  (async_round_ && !async_round_->emit_nodes && async_round_->batch_index > 0);
+    if (fixed_workspace_ && !shared) {
       auto row_ids = rows_.as<u32>();
       std::iota(row_ids, row_ids + data_.rows, u32{0});
     } else {
@@ -351,12 +370,15 @@ class TreeBuilder {
     // order therefore preserves the exact tree layout. Depth eleven needs
     // deferred-parent batching and remains on the original driver.
     // Unsupported settings use this same builder, preserving its RNG.
-    if (!learner_.integer("metal_gpu_tree", 1) || vector_ || compact_ || lossguide_ ||
+    bool has_colsample_level_node = learner_.number("colsample_bylevel", 1) < 1.0f ||
+                                    learner_.number("colsample_bynode", 1) < 1.0f;
+    if (!learner_.integer("metal_gpu_tree", 1) || vector_ || lossguide_ ||
         has_categories_ || !scan_ || !fused_ || !subtract_ || max_leaves_ ||
         max_depth_ < 2 || max_depth_ > 10 || data_.histogram_bins > 256 || scalar_tiles_ != 1 ||
-        !interactions_.empty() ||
-        learner_.number("colsample_bylevel", 1) != 1 || learner_.number("colsample_bynode", 1) != 1 ||
-        std::any_of(monotone_.begin(), monotone_.end(), [](auto value) { return value != 0; })) return false;
+        !interactions_.empty() || (sparse_pipeline_ && !parallel_splits_)) return false;
+    if (has_colsample_level_node &&
+        (!data_.cols || data_.cols > 2048 || !data_.get_info("feature_weights").empty() || async_round_))
+      return false;
     if (cache_limit_ < (std::size_t{1} << max_depth_) - 1) return false;
     return gpu_tree_scratch_bytes() <= 256 * 1024 * 1024;
   }
@@ -366,15 +388,23 @@ class TreeBuilder {
     auto parents = std::max<std::size_t>(1, n / 2);
     auto nodes = (std::size_t{1} << (max_depth_ + 1)) - 1;
     auto hist_tasks = checked_product(div_up(data_.rows, rows_per_tile_) + n,
-                                      div_up(data_.cols, features_per_group_));
+                                      sparse_pipeline_ ? std::size_t{1} : div_up(data_.cols, features_per_group_));
     auto part_tasks = div_up(data_.rows, 256) + parents;
+    bool has_monotone = std::any_of(monotone_.begin(), monotone_.end(), [](auto value) { return value != 0; });
+    bool gpu_colsample = learner_.number("colsample_bylevel", 1) < 1.0f ||
+                         learner_.number("colsample_bynode", 1) < 1.0f;
+    std::size_t extra = 0;
+    if (has_monotone) extra += (2 * n + nodes) * sizeof(Pair);
+    if (compact_) extra += sizeof(u32);
+    if (sparse_pipeline_) extra += n * sizeof(IntPair);
+    if (gpu_colsample) extra += (2 * std::size_t(data_.cols) + max_depth_ + (std::size_t{1} << max_depth_) + 8) * sizeof(u32);
     return checked_product(2 * n, histogram_words_ * sizeof(u32)) +
         checked_product(n, data_.cols * (sizeof(Split) + std::size_t{1})) +
         checked_product(hist_tasks, sizeof(HistTask)) +
         checked_product(part_tasks, sizeof(PartitionTask) + sizeof(u32)) +
         parents * (sizeof(PartitionSegment) + sizeof(Split) + 5 * sizeof(u32) + sizeof(HistSubtract)) +
         n * (2 * (3 * sizeof(u32) + sizeof(IntPair)) + sizeof(Pair) + sizeof(Split)) +
-        nodes * (sizeof(Split) + sizeof(u32)) + (std::size_t{1} << max_depth_) * sizeof(u32) + 528;
+        nodes * (sizeof(Split) + sizeof(u32)) + (std::size_t{1} << max_depth_) * sizeof(u32) + 528 + extra;
   }
 
   // Certified screening (scalar_screen.metal.h) changes only which candidates
@@ -450,11 +480,11 @@ class TreeBuilder {
     // Bins are quantize(data, cuts) of the matrix's own float data, which a
     // QuantileDMatrix decodes back to the same bins. Recoded partition inputs
     // (changed feature types) keep the float comparison.
-    bool bin_predicate = single_pass && parallel_plan &&
+    bool bin_predicate = !data_.is_sparse() && single_pass && parallel_plan &&
                          partition_input_.native() == data_.data.native() &&
                          learner_.integer("metal_partition_bin_predicate", 1) != 0;
     bool fused_subtraction = parallel_splits_ && learner_.integer("metal_fused_subtraction", 1) != 0;
-    bool histogram_compact_scratch = !histogram_present && features_per_group_ <= 2 &&
+    bool histogram_compact_scratch = !sparse_pipeline_ && !histogram_present && features_per_group_ <= 2 &&
         learner_.integer("metal_histogram_compact_scratch", !data_.quantized_dense) != 0;
     bool histogram_clear_built = fused_subtraction && learner_.integer("metal_histogram_clear_built", 1) != 0;
     std::string selected_histogram_kernel(histogram_kernel());
@@ -470,13 +500,13 @@ class TreeBuilder {
     auto packed_request = learner_.integer("metal_histogram_packed_bins", 16);
     require(packed_request == 0 || packed_request == 4 || packed_request == 16,
             "metal_histogram_packed_bins must be 0, 4 or 16.");
-    bool tiled_histograms = data_.quantized_dense || histogram_missing_;
+    bool tiled_histograms = !sparse_pipeline_ && (data_.quantized_dense || histogram_missing_);
     // A packed word holds four features, so a group must not straddle words.
     // Code 255 marks missing values, which therefore need at most 255 bins.
     // Narrow matrices interleave only the word groups they have.
     Buffer packed_bins;
     auto packed_chunk = std::max<u32>(1, std::min<u32>(packed_request / 4, div_up(data_.cols, 4)));
-    if (tiled_histograms && packed_request && 4 % features_per_group_ == 0 &&
+    if (tiled_histograms && packed_request && (4 % features_per_group_ == 0 || features_per_group_ == 8) &&
         data_.histogram_bins <= (data_.quantized_dense ? 256u : 255u))
       packed_bins = data_.packed_bins(packed_chunk);
     // Group-major records keep one feature column hot across a level's nodes;
@@ -494,23 +524,24 @@ class TreeBuilder {
     // count-based sums replace enough histogram work: at least four feature
     // groups times levels by default (one group at depth two lost 2-3%).
     auto unit_work = div_up(data_.cols, features_per_group_) * max_depth_;
-    bool unit_hessian = tiled_histograms && data_.rows && learner_.objective() == 0 &&
+    bool unit_hessian = tiled_histograms && !compact_ && data_.rows && learner_.objective() == 0 &&
                         data_.get_info("weight").empty() &&
                         learner_.integer("metal_histogram_unit_hessian", unit_work >= 4) != 0;
-    bool tiled = packed_bins || histogram_schedule || single_owner || unit_hessian;
+    bool cert_i32 = tiled_histograms && learner_.integer("metal_histogram_i32", 1) != 0;
+    bool tiled = packed_bins || histogram_schedule || single_owner || unit_hessian || features_per_group_ > 4;
     HistParams histogram_params_value = hp_;
     u32 plan_flags = 0;
     if (tiled) {
-      std::string scratch = histogram_compact_scratch ? (features_per_group_ == 1 ? "_c1" : "_c2") :
-                                                        (features_per_group_ == 1 ? "_w1" : "_w4");
+      std::string width = features_per_group_ == 1 ? "_w1" : (features_per_group_ <= 4 ? "_w4" : "_w8");
+      std::string scratch = histogram_compact_scratch ? (features_per_group_ == 1 ? "_c1" : "_c2") : width;
       std::string source = packed_bins ? "_packed" : "";
       if (unit_hessian) source += "_unit";
       selected_histogram_kernel = std::string(data_.quantized_dense ? "histogram_tiled_dense" :
                                               "histogram_tiled_missing") + scratch + source;
-      present_histogram_kernel = std::string("histogram_tiled_present") +
-                                 (features_per_group_ == 1 ? "_w1" : "_w4") + source;
+      present_histogram_kernel = std::string("histogram_tiled_present") + width + source;
       histogram_params_value.tasks = (histogram_schedule ? u32(kHistogramTileRecords) : 0u) |
           (histogram_schedule == 2 ? u32(kHistogramTileMajor) : 0u) |
+          (cert_i32 ? u32(kHistogramCertI32) : 0u) |
           (packed_bins ? packed_chunk << kHistogramPackedShift : 0u);
       plan_flags = (histogram_schedule ? u32(kHistogramPlanTiles) : 0u) |
                    (single_owner ? u32(kHistogramPlanSingleOwner) : 0u);
@@ -579,27 +610,36 @@ class TreeBuilder {
     // A node-wide cutoff shares certified lower bounds between the feature
     // groups of one node through a per-level 32-bit atomic maximum.
     bool node_cutoff = split_screening && learner_.integer("metal_split_node_cutoff", 1) != 0;
-    // Counters are read after the command completes, so asynchronous rounds
-    // do not collect them.
-    bool screening_stats = (split_screening || root_screening) && !async_round_ &&
+    bool batched_sync = async_round_ && !async_round_->emit_nodes;
+    bool batch_in_flight = batched_sync && async_round_->batch_index > 0;
+    // Counters are read after the command completes, so committed asynchronous
+    // rounds do not collect them. Synchronous multi-tree batches read them back.
+    bool screening_stats = (split_screening || root_screening) && (!async_round_ || batched_sync) &&
                            learner_.integer("metal_split_screening_stats", 0) != 0;
     // Children read their exact weight and cover from the parent's selected
     // split, written by the GPU apply step, instead of dividing again.
     bool inherit_parent = split_screening && learner_.integer("metal_split_inherit_parent", 1) != 0;
+    bool has_monotone = std::any_of(monotone_.begin(), monotone_.end(), [](auto value) { return value != 0; });
+    float bylevel_frac = learner_.number("colsample_bylevel", 1);
+    float bynode_frac = learner_.number("colsample_bynode", 1);
+    bool gpu_bylevel = bylevel_frac < 1.0f;
+    bool gpu_bynode = bynode_frac < 1.0f;
+    bool gpu_colsample = gpu_bylevel || gpu_bynode;
     // Reused scratch is written by GPU commands between levels. Never reset
     // the workspace or memcpy over buffers referenced by an unsubmitted level.
     auto capacity = u32{1} << (max_depth_ - 1);
     auto parent_capacity = std::max(1u, capacity / 2);
     auto node_capacity = (u32{1} << (max_depth_ + 1)) - 1;
     auto get = [&](std::size_t count, std::size_t width) { return workspace_.get(checked_product(count, width)); };
-    struct Bank { Buffer ids, sums, counts, offsets, histogram; };
+    struct Bank { Buffer ids, sums, counts, offsets, histogram, bounds; };
     auto bank = [&]() {
       return Bank{get(capacity, sizeof(u32)), get(capacity, sizeof(IntPair)),
                   get(capacity, sizeof(u32)), get(capacity, sizeof(u32)),
-                  get(capacity, histogram_words_ * sizeof(u32))};
+                  get(capacity, histogram_words_ * sizeof(u32)),
+                  has_monotone ? get(capacity, sizeof(Pair)) : Buffer{}};
     };
     std::array<Bank, 2> banks{bank(), bank()};
-    // Asynchronous rounds retain their readback buffers until host replay.
+    // Asynchronous and batched rounds retain their readback buffers until host replay.
     Buffer state, history, flags;
     if (async_round_) {
       state = learner_.round_output(sizeof(TreeDriverState));
@@ -614,7 +654,7 @@ class TreeBuilder {
     auto selected_children = get(parent_capacity, 2 * sizeof(i32)), parent_indices = get(parent_capacity, sizeof(u32));
     auto partition_capacity = div_up(data_.rows, 256) + parent_capacity;
     auto histogram_capacity = checked_product(div_up(data_.rows, rows_per_tile_) + capacity,
-                                              div_up(data_.cols, features_per_group_));
+                                              sparse_pipeline_ ? std::size_t{1} : div_up(data_.cols, features_per_group_));
     require(histogram_capacity <= UINT32_MAX && partition_capacity <= UINT32_MAX,
             "GPU tree task count exceeds the indirect dispatch index range.");
     auto partition_tasks = get(partition_capacity, sizeof(PartitionTask));
@@ -629,30 +669,58 @@ class TreeBuilder {
     for (auto& argument : args) argument = get(1, sizeof(TreeDriverDispatch));
     auto& [plan_hist_args, hist_args, plan_part_args, part_args, scan_args,
            evaluate_args, select_args, subtract_args, zero_args] = args;
-    std::vector<std::uint8_t> mask(checked_product(capacity, data_.cols), 0);
-    for (u32 n = 0; n < capacity; ++n)
-      for (auto feature : tree_features_) mask[std::size_t(n) * data_.cols + feature] = 1;
-    bool shared_inputs = learner_.has_inflight_rounds();
-    auto allowed = workspace_.copy_input(mask, constant_inputs_, shared_inputs);
+    bool shared_inputs = learner_.has_inflight_rounds() || batch_in_flight;
+    Buffer allowed, sample_seeds, tree_feat_buf, level_feat_buf, rng_cursor, node_seed_base, sample_node_args;
+    u32 tree_feat_count = static_cast<u32>(tree_features_.size());
+    u32 level_feat_count = tree_feat_count, node_feat_count = tree_feat_count;
+    if (gpu_colsample) {
+      level_feat_count = gpu_bylevel ? static_cast<u32>(std::max<std::size_t>(1, std::floor(tree_feat_count * bylevel_frac))) : tree_feat_count;
+      node_feat_count = gpu_bynode ? static_cast<u32>(std::max<std::size_t>(1, std::floor(level_feat_count * bynode_frac))) : level_feat_count;
+      u32 max_draws = (gpu_bylevel ? max_depth_ : 0u) + (gpu_bynode ? ((1u << max_depth_) - 1u) : 0u);
+      std::mt19937 peek_rng = rng_;
+      std::vector<u32> host_seeds(max_draws);
+      for (u32 i = 0; i < max_draws; ++i) host_seeds[i] = peek_rng();
+      sample_seeds = upload(host_seeds);
+      tree_feat_buf = upload(tree_features_);
+      level_feat_buf = get(std::max(1u, tree_feat_count), sizeof(u32));
+      rng_cursor = get(1, sizeof(u32));
+      node_seed_base = get(1, sizeof(u32));
+      sample_node_args = get(1, sizeof(TreeDriverDispatch));
+      allowed = get(checked_product(capacity, data_.cols), sizeof(std::uint8_t));
+    } else {
+      std::vector<std::uint8_t> mask(checked_product(capacity, data_.cols), 0);
+      for (u32 n = 0; n < capacity; ++n)
+        for (auto feature : tree_features_) mask[std::size_t(n) * data_.cols + feature] = 1;
+      allowed = workspace_.copy_input(mask, constant_inputs_, shared_inputs);
+    }
     auto infinity = std::numeric_limits<float>::infinity();
-    auto bounds = workspace_.copy_input(std::vector<Pair>(capacity, Pair{-infinity, infinity}),
-                                        constant_inputs_, shared_inputs);
+    Buffer bounds = has_monotone ? Buffer{} :
+        workspace_.copy_input(std::vector<Pair>(capacity, Pair{-infinity, infinity}),
+                              constant_inputs_, shared_inputs);
+    Buffer history_bounds = has_monotone ?
+        (deferred_statistics ? get(node_capacity, sizeof(Pair)) : banks[0].bounds) : Buffer{};
     auto unused = get(0, 1);
+    auto sampled_count = compact_ ? get(1, sizeof(u32)) : state;
     // Level d uses cells [2^d - 1, 2^(d + 1) - 1); one clear per tree suffices.
     auto node_cut = node_cutoff ? get(std::size_t{1} << max_depth_, sizeof(u32)) : unused;
-    // Counters are host-zeroed; only synchronous rounds collect them. The
-    // unit-Hessian flag is cleared on the GPU, so committed asynchronous
+    // Counters are zeroed before encoding; only synchronous rounds collect them.
+    // The unit-Hessian flag is cleared on the GPU, so committed asynchronous
     // rounds never see a host store into a slot they may still read.
     auto screen_counters = screening_stats ?
-        workspace_.copy_input(std::array<u32, 6>{}, false, shared_inputs) : unused;
-    auto unit_mismatch = unit_hessian ? get(1, sizeof(u32)) : unused;
-    TreeDriverParams p{sp_, {1, data_.cols, features_per_group_, rows_per_tile_, 1, plan_flags},
+        (batched_sync ? learner_.round_output(6 * sizeof(u32)) :
+                        workspace_.copy_input(std::array<u32, 6>{}, false, shared_inputs)) : unused;
+    auto unit_mismatch = unit_hessian ?
+        (batched_sync ? learner_.round_output(sizeof(u32)) : get(1, sizeof(u32))) : unused;
+    auto node_totals = sparse_pipeline_ ? get(capacity, sizeof(IntPair)) : unused;
+    TreeDriverParams p{sp_, {1, data_.cols, sparse_pipeline_ ? data_.cols : features_per_group_, rows_per_tile_, 1, plan_flags},
                        {data_.rows, data_.cols, 0, learner_.integer("metal_partition_aggregation", 1)},
                        max_depth_, node_capacity, static_cast<u32>(parallel_splits_),
                        static_cast<u32>(histogram_words_ / 4), min_gain_,
                        (parallel_select ? kTreeDriverParallelSelect : 0u) |
                            (parallel_plan ? kTreeDriverParallelPlan : 0u) |
-                           (data_.quantized_dense ? kTreeDriverDenseRoot : 0u), 0, 0};
+                           (data_.quantized_dense ? kTreeDriverDenseRoot : 0u) |
+                           (compact_ ? kTreeDriverSampledRows : 0u) |
+                           (has_monotone ? kTreeDriverMonotone : 0u), 0, 0};
     // One threadgroup scans a frontier of at most `capacity` slots.
     auto control_threads = std::clamp<std::size_t>(capacity, 32, kTreeDriverSlots);
     char const* plan_kernel = parallel_plan ?
@@ -662,37 +730,65 @@ class TreeBuilder {
     std::optional<Command> owned;
     if (!root_command_) owned.emplace("GPU tree construction", coalesce_, compute_fill_);
     auto& command = root_command_ ? *root_command_ : *owned;
+    if (batch_in_flight) command.set_coalescing(false);
+    auto encoders_before = batch_in_flight && root_command_ ? command.encoder_count() : std::size_t{0};
     // Row identities, the unit-Hessian check and the node-cutoff clear share
     // the initialization encoder; serial dispatch makes them visible to the
     // first partition, histogram and split kernels.
-    command.set_coalescing(coalesce_ || gpu_row_init_ || unit_hessian || node_cutoff);
-    if (gpu_row_init_)
+    command.set_coalescing(coalesce_ || gpu_row_init_ || compact_ || unit_hessian ||
+                           node_cutoff || has_monotone || gpu_colsample ||
+                           (screening_stats && batched_sync));
+    if (compact_) {
+      command.dispatch("fill_zero", {sampled_count}, static_cast<u64>(sampled_count.size()), {1, 1, 1});
+      if (data_.rows)
+        command.dispatch("tree_rows_compact_sampled", {gradient_, rows_, sampled_count}, hp_,
+                         {div_up(data_.rows, 256), 1, 1});
+    } else if (gpu_row_init_) {
       command.dispatch("tree_rows_init", {rows_}, data_.rows, {div_up(data_.rows, 256), 1, 1});
+    }
     if (unit_hessian) {
       command.dispatch("fill_zero", {unit_mismatch}, static_cast<u64>(unit_mismatch.size()), {1, 1, 1});
       command.dispatch("histogram_unit_hessian_check", {gradient_, unit_mismatch}, hp_, {div_up(data_.rows, 256), 1, 1});
     }
+    if (screening_stats && batched_sync)
+      command.dispatch("fill_zero", {screen_counters}, static_cast<u64>(screen_counters.size()), {1, 1, 1});
     if (node_cutoff)
       command.dispatch("fill_zero", {node_cut}, static_cast<u64>(node_cut.size()), {1, 1, 1});
+    if (has_monotone)
+      command.dispatch("tree_init_bounds", {banks[0].bounds, history_bounds}, 0u, {1, 1, 1}, {1, 1, 1});
+    if (gpu_colsample)
+      command.dispatch("fill_zero", {rng_cursor}, static_cast<u64>(rng_cursor.size()), {1, 1, 1});
     if (control_fusion)
       command.dispatch(parallel_control ? "tree_driver_init_prepare_parallel" : "tree_driver_init_prepare",
                        {state, banks[0].ids, banks[0].sums,
                        banks[0].counts, banks[0].offsets, flags, split_params, histogram_params,
                        partition_params, parent_count, plan_hist_args, hist_args, plan_part_args,
                        part_args, scan_args, evaluate_args, select_args, subtract_args,
-                       zero_bytes, zero_args}, p, {1, 1, 1}, {1, 1, 1});
+                       zero_bytes, zero_args, sampled_count}, p, {1, 1, 1}, {1, 1, 1});
     else
       command.dispatch("tree_driver_init", {state, banks[0].ids, banks[0].sums,
-                       banks[0].counts, banks[0].offsets, flags}, p, {1, 1, 1}, {1, 1, 1});
+                       banks[0].counts, banks[0].offsets, flags, sampled_count}, p, {1, 1, 1}, {1, 1, 1});
     command.set_coalescing(coalesce_);
     for (u32 depth = 0; depth < max_depth_; ++depth) {
       auto& current = banks[depth & 1u];
       auto& other = banks[(depth & 1u) ^ 1u];
+      auto const& active_bounds = has_monotone ? current.bounds : bounds;
       if (!control_fusion)
         command.dispatch("tree_driver_prepare", {state, split_params, histogram_params, partition_params,
                        parent_count, plan_hist_args, hist_args, plan_part_args, part_args, scan_args,
                        evaluate_args, select_args, subtract_args, zero_bytes, zero_args}, p,
                        {1, 1, 1}, {1, 1, 1});
+      if (gpu_colsample) {
+        TreeSampleParams tsp{data_.cols, tree_feat_count, level_feat_count, node_feat_count,
+                             static_cast<u32>(gpu_bylevel), static_cast<u32>(gpu_bynode), 0, 0};
+        command.dispatch("tree_sample_level",
+                         {state, sample_seeds, tree_feat_buf, level_feat_buf,
+                          rng_cursor, node_seed_base, sample_node_args},
+                         tsp, {1, 1, 1}, {32, 1, 1});
+        command.dispatch_indirect("tree_sample_nodes",
+                                  {sample_seeds, level_feat_buf, node_seed_base, allowed},
+                                  tsp, sample_node_args, {32, 1, 1});
+      }
       if (depth) {
         if (!parallel_plan && !single_pass)
           command.dispatch_indirect("plan_partitions", {selected_counts, selected_offsets, selected_children,
@@ -712,7 +808,13 @@ class TreeBuilder {
         if (single_pass) {
           // Children counts are the final atomic cursors; offsets follow from
           // them exactly as in the stable scan's per-segment epilogue.
-          if (bin_predicate)
+          if (data_.is_sparse())
+            command.dispatch_indirect("partition_two_ended_csr",
+                                      {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, partition_input_,
+                                       rows_, selected_splits, partition_tasks, segments, current.counts,
+                                       scratch_rows_, unused, partition_params},
+                                      nullptr, 0, part_args);
+          else if (bin_predicate)
             command.dispatch_indirect("partition_two_ended_bins", {partition_input_, rows_, selected_splits,
                                       partition_tasks, segments, current.counts, scratch_rows_, unused,
                                       partition_params, data_.bins, block_counts}, nullptr, 0, part_args);
@@ -723,9 +825,16 @@ class TreeBuilder {
           command.dispatch_indirect("partition_atomic_offsets", {segments, current.counts, current.offsets,
                                     partition_params}, nullptr, 0, scan_args, {64, 1, 1});
         } else {
-          command.dispatch_indirect("partition_segment_flags", {partition_input_, rows_, selected_splits,
-                                    partition_tasks, ranks_, block_counts, unused, partition_params},
-                                    nullptr, 0, part_args);
+          if (data_.is_sparse())
+            command.dispatch_indirect("partition_segment_flags_csr",
+                                      {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, partition_input_,
+                                       rows_, selected_splits, partition_tasks, ranks_, block_counts, unused,
+                                       partition_params},
+                                      nullptr, 0, part_args);
+          else
+            command.dispatch_indirect("partition_segment_flags", {partition_input_, rows_, selected_splits,
+                                      partition_tasks, ranks_, block_counts, unused, partition_params},
+                                      nullptr, 0, part_args);
           command.dispatch_indirect("partition_segment_scan", {segments, block_counts, current.counts,
                                     current.offsets, partition_params}, nullptr, 0, scan_args, {64, 1, 1});
           command.dispatch_indirect("partition_segment_scatter", {rows_, partition_tasks, segments, ranks_,
@@ -740,11 +849,23 @@ class TreeBuilder {
                                   hp_, evaluate_args);
       else
         command.dispatch_indirect("fill_zero", {current.histogram, zero_bytes}, nullptr, 0, zero_args);
+      if (sparse_pipeline_)
+        command.dispatch("fill_zero", {node_totals}, static_cast<u64>(node_totals.size()), {1, 1, 1});
       command.dispatch_indirect("plan_histograms", {current.counts, current.offsets, parent_indices,
                                 histogram_tasks, subtraction, hist_args, histogram_params}, nullptr, 0,
                                 plan_hist_args, {64, 1, 1});
       auto const& histogram_kernel_name = depth && histogram_present ? present_histogram_kernel : selected_histogram_kernel;
-      if (tiled)
+      if (sparse_pipeline_) {
+        command.dispatch_indirect("histogram_csr_accumulate",
+                                  {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, data_.sparse_->csr_bins,
+                                   rows_, gradient_, histogram_tasks, current.histogram, node_totals},
+                                  hp_, hist_args);
+        SparseParams sp_csr{data_.rows, data_.cols, data_.sparse_->nnz, data_.histogram_bins,
+                            kNaN, 0, static_cast<u32>(depth > 0), targets_};
+        command.dispatch_indirect("histogram_csr_finalize_missing",
+                                  {current.histogram, node_totals, data_.cut_counts, current.counts},
+                                  sp_csr, evaluate_args, {32, 1, 1});
+      } else if (tiled)
         command.dispatch_indirect(histogram_kernel_name, {histogram_bins, rows_, gradient_, scales_, histogram_tasks,
                                   current.histogram, unit_mismatch}, histogram_params_value, hist_args);
       else
@@ -759,7 +880,7 @@ class TreeBuilder {
         command.dispatch_indirect(terminal_histogram_elision && depth + 1 == max_depth_ ?
                                       terminal_split_kernel : fused_split_kernel,
                                   {current.histogram, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
-                                   monotone_buffer_, bounds, allowed, candidates, data_.categorical,
+                                   monotone_buffer_, active_bounds, allowed, candidates, data_.categorical,
                                    unused, unused, unused, current.sums, split_params,
                                    other.histogram, subtraction, node_cut, screen_counters, selected_splits},
                                   screen, evaluate_args, {256, 1, 1});
@@ -767,14 +888,14 @@ class TreeBuilder {
         command.dispatch_indirect(terminal_histogram_elision && depth + 1 == max_depth_ ?
                                       terminal_split_kernel : fused_split_kernel,
                                   {current.histogram, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
-                                   monotone_buffer_, bounds, allowed, candidates, data_.categorical,
+                                   monotone_buffer_, active_bounds, allowed, candidates, data_.categorical,
                                    unused, unused, unused, current.sums, split_params,
                                    other.histogram, subtraction}, nullptr, 0, evaluate_args,
                                   {parallel_split_groups ? 256u : 32u, 1, 1});
       else if (!depth && root_screening)
         command.dispatch_indirect(parallel_root_kernel,
                                   {current.histogram, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
-                                   monotone_buffer_, bounds, allowed, candidates, data_.categorical,
+                                   monotone_buffer_, active_bounds, allowed, candidates, data_.categorical,
                                    unused, unused, unused, current.sums, split_params, screen_counters},
                                   screen, evaluate_args, {256, 1, 1});
       else
@@ -782,20 +903,23 @@ class TreeBuilder {
                                   parallel_root_kernel :
                                   split_kernel(),
                                   {current.histogram, scales_, data_.cuts, data_.cut_counts, data_.cut_minima,
-                                   monotone_buffer_, bounds, allowed, candidates, data_.categorical,
+                                   monotone_buffer_, active_bounds, allowed, candidates, data_.categorical,
                                    unused, unused, unused, current.sums, split_params},
                                   nullptr, 0, evaluate_args, {!depth && parallel_root ? 256u : parallel_splits_ ? 32u : 64u, 1, 1});
       if (!depth && data_.quantized_dense)
-        command.dispatch_indirect("select_dense_root_split", {candidates, best, scales_, bounds,
+        command.dispatch_indirect("select_dense_root_split", {candidates, best, scales_, active_bounds,
                                   current.histogram, data_.cut_counts, data_.cuts, data_.cut_minima,
                                   split_params}, nullptr, 0, select_args);
       else if (parallel_select)
         command.dispatch_indirect(deferred_statistics ? "select_splits_simd_deferred" : "select_splits_simd",
-                                  {candidates, best, scales_, bounds, split_params},
+                                  {candidates, best, scales_, active_bounds, split_params},
                                   nullptr, 0, select_args, {32, 1, 1});
       else
-        command.dispatch_indirect("select_splits", {candidates, best, scales_, bounds, split_params},
+        command.dispatch_indirect("select_splits", {candidates, best, scales_, active_bounds, split_params},
                                   nullptr, 0, select_args, {64, 1, 1});
+      if (has_monotone && deferred_statistics)
+        command.dispatch("tree_record_node_bounds", {state, current.ids, current.bounds, history_bounds},
+                         0u, {div_up(capacity, 64), 1, 1}, {64, 1, 1});
       if (control_fusion)
         command.dispatch(parallel_control ? "tree_driver_apply_prepare_parallel" : "tree_driver_apply_prepare",
                          {state, current.ids, best, current.counts, current.offsets,
@@ -808,11 +932,16 @@ class TreeBuilder {
         command.dispatch("tree_driver_apply", {state, current.ids, best, current.counts, current.offsets,
                          history, flags, other.ids, other.sums, selected_splits, selected_counts,
                          selected_offsets, selected_children, parent_indices}, p, {1, 1, 1}, {1, 1, 1});
+      if (has_monotone && depth + 1 < max_depth_)
+        command.dispatch("tree_propagate_child_bounds",
+                         {state, parent_indices, selected_splits, monotone_buffer_, current.bounds, other.bounds},
+                         0u, {div_up(parent_capacity, 64), 1, 1}, {64, 1, 1});
     }
     // Deferred applied statistics complete the history that host replay and
     // asynchronous node emission read.
     if (deferred_statistics)
-      command.dispatch("tree_driver_applied_statistics", {state, history, flags, scales_, bounds}, p,
+      command.dispatch("tree_driver_applied_statistics",
+                       {state, history, flags, scales_, has_monotone ? history_bounds : bounds}, p,
                        {div_up(node_capacity, 64), 1, 1}, {64, 1, 1});
     // Path selections are known once encoded; only the evaluated depth
     // depends on GPU results.
@@ -835,6 +964,7 @@ class TreeBuilder {
     learner_.active_tuning["histogram_packed_bins"] = packed_bins ? packed_request : 0;
     // Selection; synchronous rounds replace it with the GPU check's result.
     learner_.active_tuning["histogram_unit_hessian"] = unit_hessian;
+    learner_.active_tuning["histogram_i32"] = tiled && cert_i32;
     learner_.active_tuning["terminal_histogram_elision"] = terminal_histogram_elision;
     learner_.active_tuning["parallel_select"] = parallel_select;
     learner_.active_tuning["deferred_parent_statistics"] = deferred_statistics;
@@ -852,7 +982,16 @@ class TreeBuilder {
     learner_.active_tuning["replay_path_elision"] = path_elision_;
     learner_.active_tuning["tree_buffer_requests"] = workspace_.requests;
     learner_.active_tuning["tree_buffer_allocations"] = workspace_.allocations;
-    GpuTreeRound round{state, flags, history, {}, {}, eta_, tree_.group, tree_.round, node_capacity, !path_elision_};
+    GpuTreeRound round{state, flags, history, {}, {}, eta_, tree_.group, tree_.round, node_capacity,
+                       async_round_ ? async_round_->batch_index : 0u, !path_elision_};
+    if (batched_sync) {
+      round.emit_nodes = false;
+      round.unit_mismatch = unit_hessian ? unit_mismatch : Buffer{};
+      round.screen_counters = screening_stats ? screen_counters : Buffer{};
+      learner_.active_tuning["tree_encoders"] += static_cast<u32>(command.encoder_count() - encoders_before);
+      *async_round_ = std::move(round);
+      return {};
+    }
     if (async_round_) {
       // The next round's margin update reads this table on the GPU. The
       // learner replays the same history and compares before publishing.
@@ -874,6 +1013,7 @@ class TreeBuilder {
     }
     learner_.record(root_command_ ? "gradient_tree" : "gpu_tree", command.wait());
     learner_.active_tuning["tree_encoders"] += command.encoder_count();
+    if (gpu_colsample) rng_.discard(*rng_cursor.as<u32>());
     if (unit_hessian) learner_.active_tuning["histogram_unit_hessian"] = !unit_mismatch.as<u32>()[0];
     if (screening_stats) record_screening(screen_counters);
     u32 evaluated_levels = 0;
@@ -1000,8 +1140,21 @@ class TreeBuilder {
     Buffer block_counts = workspace_.get(capacity * sizeof(u32));
     PartitionParams pp{data_.rows, data_.cols, nodes, learner_.integer("metal_partition_aggregation", 1)};
     if (scan_) {
-      if (fused_) command.dispatch_indirect("partition_segment_flags", {partition_input_, rows_, split_buffer, tasks, ranks_, block_counts, category_buffer}, pp, arguments);
-      else command.dispatch("partition_segment_flags", {partition_input_, rows_, split_buffer, tasks, ranks_, block_counts, category_buffer}, pp, {capacity, 1, 1});
+      if (data_.is_sparse()) {
+        if (fused_)
+          command.dispatch_indirect("partition_segment_flags_csr",
+                                    {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, partition_input_,
+                                     rows_, split_buffer, tasks, ranks_, block_counts, category_buffer},
+                                    pp, arguments);
+        else
+          command.dispatch("partition_segment_flags_csr",
+                           {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, partition_input_,
+                            rows_, split_buffer, tasks, ranks_, block_counts, category_buffer},
+                           pp, {capacity, 1, 1});
+      } else {
+        if (fused_) command.dispatch_indirect("partition_segment_flags", {partition_input_, rows_, split_buffer, tasks, ranks_, block_counts, category_buffer}, pp, arguments);
+        else command.dispatch("partition_segment_flags", {partition_input_, rows_, split_buffer, tasks, ranks_, block_counts, category_buffer}, pp, {capacity, 1, 1});
+      }
       command.dispatch("partition_segment_scan", {segments, block_counts, output.counts, output.offsets},
                        pp, {div_up(parents.size(), 64), 1, 1}, {64, 1, 1});
       if (fused_) command.dispatch_indirect("partition_segment_scatter", {rows_, tasks, segments, ranks_, block_counts, output.offsets, scratch_rows_}, pp, arguments);
@@ -1009,7 +1162,13 @@ class TreeBuilder {
     } else {
       Buffer cursors = workspace_.get(nodes * sizeof(u32));
       command.zero(output.counts); command.zero(cursors);
-      command.dispatch("partition_atomic_count", {partition_input_, rows_, split_buffer, tasks, ranks_, output.counts, category_buffer}, pp, {capacity, 1, 1});
+      if (data_.is_sparse())
+        command.dispatch("partition_atomic_count_csr",
+                         {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, partition_input_,
+                          rows_, split_buffer, tasks, ranks_, output.counts, category_buffer},
+                         pp, {capacity, 1, 1});
+      else
+        command.dispatch("partition_atomic_count", {partition_input_, rows_, split_buffer, tasks, ranks_, output.counts, category_buffer}, pp, {capacity, 1, 1});
       command.dispatch("partition_atomic_offsets", {segments, output.counts, output.offsets},
                        pp, {div_up(parents.size(), 64), 1, 1}, {64, 1, 1});
       command.dispatch("partition_atomic_scatter", {rows_, tasks, ranks_, output.offsets, cursors, scratch_rows_}, pp, {capacity, 1, 1});
@@ -1025,6 +1184,11 @@ class TreeBuilder {
   }
 
   void histogram_tasks(std::vector<HistTask>& tasks, u32 begin, u32 count, u32 node) const {
+    if (sparse_pipeline_) {
+      for (u32 i = 0; i < count; i += rows_per_tile_)
+        tasks.push_back({begin + i, begin + std::min(i + rows_per_tile_, count), node, 0});
+      return;
+    }
     for (u32 feature = 0; feature < data_.cols; feature += features_per_group_)
       for (u32 i = 0; i < count; i += rows_per_tile_)
         tasks.push_back({begin + i, begin + std::min(i + rows_per_tile_, count), node, feature});
@@ -1055,7 +1219,27 @@ class TreeBuilder {
     for (auto const& [source, mapping] : copies)
       command.dispatch("copy_histograms", {source->data, workspace_.copy(mapping), combined}, hp_,
                        {div_up(histogram_words_, 256), mapping.size(), 1});
-    command.dispatch(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, workspace_.copy(rebuild), combined}, hp_, {rebuild.size(), targets_, 1});
+    if (sparse_pipeline_) {
+      if (!rebuild.empty()) {
+        Buffer rebuild_totals = workspace_.get(checked_product(checked_product(parents.size(), targets_), sizeof(IntPair)));
+        command.zero(rebuild_totals);
+        command.dispatch("histogram_csr_accumulate",
+                         {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, data_.sparse_->csr_bins,
+                          rows_, gradient_, workspace_.copy(rebuild), combined, rebuild_totals},
+                         hp_, {rebuild.size(), targets_, 1});
+        // Finalize only rebuilt parent slots (those not copied from existing pages).
+        Buffer dummy_counts = workspace_.copy(std::vector<u32>(parents.size(), 0));
+        for (u32 i = 0; i < parents.size(); ++i) {
+          if (parents[i].page && parents[i].page->data) continue;
+          SparseParams sp_csr{data_.rows, data_.cols, data_.sparse_->nnz, data_.histogram_bins, kNaN, i + 1, 0, targets_};
+          command.dispatch("histogram_csr_finalize_missing",
+                           {combined, rebuild_totals, data_.cut_counts, dummy_counts},
+                           sp_csr, {data_.cols, 1, targets_}, {32, 1, 1});
+        }
+      }
+    } else {
+      command.dispatch(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, workspace_.copy(rebuild), combined}, hp_, {rebuild.size(), targets_, 1});
+    }
     return {std::move(combined), std::move(indices)};
   }
 
@@ -1118,17 +1302,32 @@ class TreeBuilder {
     Buffer hist(checked_product(n, histogram_words_) * sizeof(u32));
     command.zero(hist);
     Buffer subtraction_buffer = workspace_.get(subtraction_count * sizeof(HistSubtract));
+    Buffer node_totals = sparse_pipeline_ ? workspace_.get(checked_product(checked_product(n, targets_), sizeof(IntPair))) : Buffer{};
+    if (sparse_pipeline_) command.zero(node_totals);
     if (fused_) {
       std::size_t rows = parents.empty() ? data_.rows : 0;
       for (auto const& leaf : parents) rows += leaf.count;
-      auto capacity = checked_product(div_up(rows, rows_per_tile_) + n, div_up(data_.cols, features_per_group_));
+      u32 plan_fpg = sparse_pipeline_ ? std::max(1u, data_.cols) : features_per_group_;
+      auto capacity = checked_product(div_up(rows, rows_per_tile_) + n, div_up(data_.cols, plan_fpg));
       require(capacity <= UINT32_MAX, "Histogram task count exceeds the indirect dispatch index range.");
       Buffer tasks = workspace_.get(capacity * sizeof(HistTask));
       auto arguments = dispatch_arguments(targets_);
-      HistogramPlanParams plan{n, data_.cols, features_per_group_, rows_per_tile_, static_cast<u32>(subtraction_count != 0), 0};
+      HistogramPlanParams plan{n, data_.cols, plan_fpg, rows_per_tile_, static_cast<u32>(subtraction_count != 0), 0};
       command.dispatch("plan_histograms", {segments.counts, segments.offsets, workspace_.copy(parent_indices), tasks, subtraction_buffer, arguments},
                        plan, {div_up(n, 64), 1, 1}, {64, 1, 1});
-      command.dispatch_indirect(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, tasks, hist}, hp_, arguments);
+      if (sparse_pipeline_) {
+        command.dispatch_indirect("histogram_csr_accumulate",
+                                  {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, data_.sparse_->csr_bins,
+                                   rows_, gradient_, tasks, hist, node_totals},
+                                  hp_, arguments);
+        SparseParams sp_csr{data_.rows, data_.cols, data_.sparse_->nnz, data_.histogram_bins,
+                            kNaN, 0, static_cast<u32>(subtraction_count != 0), targets_};
+        command.dispatch("histogram_csr_finalize_missing",
+                         {hist, node_totals, data_.cut_counts, segments.counts},
+                         sp_csr, {data_.cols, n, targets_}, {32, 1, 1});
+      } else {
+        command.dispatch_indirect(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, tasks, hist}, hp_, arguments);
+      }
     } else {
       std::vector<HistTask> tasks;
       std::vector<HistSubtract> subtraction;
@@ -1142,7 +1341,19 @@ class TreeBuilder {
         histogram_tasks(tasks, segments.offsets.as<u32>()[i], segments.counts.as<u32>()[i], i);
       }
       subtraction_buffer = workspace_.copy(subtraction);
-      command.dispatch(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, workspace_.copy(tasks), hist}, hp_, {tasks.size(), targets_, 1});
+      if (sparse_pipeline_) {
+        command.dispatch("histogram_csr_accumulate",
+                         {data_.sparse_->csr_row_ptr, data_.sparse_->csr_col_idx, data_.sparse_->csr_bins,
+                          rows_, gradient_, workspace_.copy(tasks), hist, node_totals},
+                         hp_, {tasks.size(), targets_, 1});
+        SparseParams sp_csr{data_.rows, data_.cols, data_.sparse_->nnz, data_.histogram_bins,
+                            kNaN, 0, static_cast<u32>(subtraction_count != 0), targets_};
+        command.dispatch("histogram_csr_finalize_missing",
+                         {hist, node_totals, data_.cut_counts, segments.counts},
+                         sp_csr, {data_.cols, n, targets_}, {32, 1, 1});
+      } else {
+        command.dispatch(histogram_kernel(), {data_.bins, rows_, gradient_, scales_, workspace_.copy(tasks), hist}, hp_, {tasks.size(), targets_, 1});
+      }
     }
     if (subtraction_count && !fallback_parallel_splits)
       command.dispatch("subtract_histograms", {parent_hist, subtraction_buffer, hist}, hp_,
@@ -1411,7 +1622,7 @@ class TreeBuilder {
   float min_gain_;
   bool vector_, compact_, lossguide_, scan_, fused_, subtract_, coalesce_, compute_fill_, parallel_splits_, fixed_workspace_, histogram_missing_, has_categories_;
   bool gpu_row_init_, constant_inputs_, path_elision_;
-  bool split_skip_empty_bins_{false}, fallback_wide_cuts_{false};
+  bool split_skip_empty_bins_{false}, fallback_wide_cuts_{false}, sparse_pipeline_{false};
   u32 rows_per_tile_, features_per_group_;
   u32 scalar_tile_{0}, scalar_tiles_{1};
   std::size_t histogram_words_, cache_limit_, cached_nodes_{0};
@@ -1535,7 +1746,13 @@ void Learner::update_vector_leaves(Tree& tree, Matrix const& data, Buffer const&
   Command command("vector leaf value gradients", integer("metal_coalesce_encoders", 0), integer("metal_compute_fill", 0));
   command.zero(sums);
   auto bounds = data.partition_category_bounds(); p.padding = static_cast<u32>(static_cast<bool>(bounds));
-  command.dispatch("vector_leaf_sums", {data.partition_data(), nodes, categories, gradient, sums, bounds ? bounds : scales}, p, {div_up(data.rows, 256), groups, 1});
+  if (data.is_sparse())
+    command.dispatch("vector_leaf_sums_csr",
+                     {data.sparse_->csr_row_ptr, data.sparse_->csr_col_idx, data.partition_data(),
+                      nodes, categories, gradient, sums, bounds ? bounds : scales},
+                     p, {div_up(data.rows, 256), groups, 1});
+  else
+    command.dispatch("vector_leaf_sums", {data.partition_data(), nodes, categories, gradient, sums, bounds ? bounds : scales}, p, {div_up(data.rows, 256), groups, 1});
   command.dispatch("vector_leaf_weights", {nodes, sums, scales, weights}, p, {div_up(tree.nodes.size(), 256), groups, 1});
   record("vector_leaf_update", command.wait());
   std::memcpy(tree.leaf_weights.data(), weights.data(), tree.leaf_weights.size() * sizeof(float));

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import collections
 import copy
 import ctypes
 import json
@@ -36,9 +37,6 @@ from typing import (
     cast,
 )
 
-import numpy as np
-import scipy.sparse
-
 from ._c_api import (
     _LIB,
     _check_call,
@@ -52,13 +50,16 @@ from ._data_utils import (
     Categories,
     TransformedDf,
     _ensure_np_dtype,
+    array_hasobject,
     array_interface,
     cuda_array_interface,
     from_array_interface,
     make_array_interface,
 )
+from ._metal_array import MetalArray, try_buffer_descriptor
 from ._typing import (
     _T,
+    HAS_NUMPY,
     ArrayLike,
     ArrowCatList,
     BoosterParam,
@@ -89,7 +90,13 @@ from .compat import (
 )
 from .objective import Objective, TreeObjective, _grad_arrinf
 
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
+
 if TYPE_CHECKING:
+    import numpy as np
     from pandas import DataFrame as PdDataFrame
 
 
@@ -247,17 +254,20 @@ def c_array(
     ctype: Type[CTypeT], values: ArrayLike
 ) -> Union[ctypes.Array, ctypes._Pointer]:
     """Convert a python array to c array."""
-    if isinstance(values, np.ndarray) and values.dtype.itemsize == ctypes.sizeof(ctype):
+    if HAS_NUMPY and np is not None and isinstance(values, np.ndarray) and values.dtype.itemsize == ctypes.sizeof(ctype):
         return values.ctypes.data_as(ctypes.POINTER(ctype))
+    if isinstance(values, MetalArray) and values.is_c_contiguous and values.itemsize == ctypes.sizeof(ctype):
+        return ctypes.cast(values.data_ptr, ctypes.POINTER(ctype))
     return (ctype * len(values))(*values)
 
 
 def _prediction_output(
     shape: CNumericPtr, dims: c_bst_ulong, predts: CFloatPtr, is_cuda: bool
 ) -> NumpyOrCupy:
-    arr_shape = tuple(ctypes2numpy(shape, dims.value, np.uint64).flatten())
+    arr_shape = tuple(int(shape[i]) for i in range(dims.value))
+    dt: Any = np.float32 if (HAS_NUMPY and np is not None) else "float32"
     array = from_array_interface(
-        make_array_interface(predts, arr_shape, np.float32, is_cuda)
+        make_array_interface(predts, arr_shape, dt, is_cuda)
     )
     return array
 
@@ -804,7 +814,7 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         if group is not None and qid is not None:
             raise ValueError("Either one of `group` or `qid` should be None.")
 
-        self.missing = missing if missing is not None else np.nan
+        self.missing = missing if missing is not None else math.nan
         self.nthread = nthread if nthread is not None else -1
         self.silent = silent
 
@@ -1088,7 +1098,7 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         """Get the base margin of the DMatrix."""
         return self._get_info("base_margin")
 
-    def get_group(self) -> np.ndarray:
+    def get_group(self) -> Any:
         """Get the group of the DMatrix.
 
         Returns
@@ -1096,9 +1106,20 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         group
         """
         group_ptr = self._get_info("group_ptr")
-        return np.diff(group_ptr)
+        if HAS_NUMPY and np is not None and isinstance(group_ptr, np.ndarray):
+            return np.diff(group_ptr)
+        gp = group_ptr.tolist()
+        diff = [int(gp[i + 1] - gp[i]) for i in range(len(gp) - 1)]
+        return MetalArray.from_list(diff, dtype="uint32") if diff else MetalArray.empty((0,), dtype="uint32")
 
-    def get_data(self) -> scipy.sparse.csr_matrix:
+    @property
+    def was_zero_copied(self) -> bool:
+        """True if this DMatrix zero-copied unified memory via Metal newBufferWithBytesNoCopy."""
+        out = ctypes.c_int(0)
+        _check_call(_LIB.XGDMatrixWasZeroCopied(self.handle, ctypes.byref(out)))
+        return bool(out.value)
+
+    def get_data(self) -> Any:
         """Get the predictors from DMatrix as a CSR matrix. This getter is mostly for
         testing purposes. If this is a quantized DMatrix then quantized values are
         returned instead of input values.
@@ -1106,24 +1127,49 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         .. versionadded:: 1.7.0
 
         """
-        indptr = np.empty(self.num_row() + 1, dtype=np.uint64)
-        indices = np.empty(self.num_nonmissing(), dtype=np.uint32)
-        data = np.empty(self.num_nonmissing(), dtype=np.float32)
+        if HAS_NUMPY and np is not None:
+            indptr = np.empty(self.num_row() + 1, dtype=np.uint64)
+            indices = np.empty(self.num_nonmissing(), dtype=np.uint32)
+            data = np.empty(self.num_nonmissing(), dtype=np.float32)
 
-        c_indptr = indptr.ctypes.data_as(ctypes.POINTER(c_bst_ulong))
-        c_indices = indices.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32))
-        c_data = data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            c_indptr = indptr.ctypes.data_as(ctypes.POINTER(c_bst_ulong))
+            c_indices = indices.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32))
+            c_data = data.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            config = from_pystr_to_cstr(json.dumps({}))
+
+            _check_call(
+                _LIB.XGDMatrixGetDataAsCSR(self.handle, config, c_indptr, c_indices, c_data)
+            )
+            try:
+                import scipy.sparse
+
+                return scipy.sparse.csr_matrix(
+                    (data, indices, indptr), shape=(self.num_row(), self.num_col())
+                )
+            except ImportError:
+                from ._sparse import CSRMatrix
+
+                return CSRMatrix(
+                    (data, indices, indptr), shape=(self.num_row(), self.num_col())
+                )
+
+        from ._sparse import CSRMatrix
+
+        indptr_m = MetalArray.empty((self.num_row() + 1,), dtype="int64")
+        indices_m = MetalArray.empty((self.num_nonmissing(),), dtype="int32")
+        data_m = MetalArray.empty((self.num_nonmissing(),), dtype="float32")
+        c_indptr = ctypes.cast(indptr_m.data_ptr, ctypes.POINTER(c_bst_ulong))
+        c_indices = ctypes.cast(indices_m.data_ptr, ctypes.POINTER(ctypes.c_uint32))
+        c_data = ctypes.cast(data_m.data_ptr, ctypes.POINTER(ctypes.c_float))
         config = from_pystr_to_cstr(json.dumps({}))
-
         _check_call(
             _LIB.XGDMatrixGetDataAsCSR(self.handle, config, c_indptr, c_indices, c_data)
         )
-        ret = scipy.sparse.csr_matrix(
-            (data, indices, indptr), shape=(self.num_row(), self.num_col())
+        return CSRMatrix(
+            (data_m, indices_m, indptr_m), shape=(self.num_row(), self.num_col())
         )
-        return ret
 
-    def get_quantile_cut(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_quantile_cut(self) -> Tuple[Any, Any]:
         """Get quantile cuts for quantization.
 
         .. versionadded:: 2.0.0
@@ -1145,12 +1191,12 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
         i_indptr = json.loads(c_sindptr.value)
         indptr = from_array_interface(i_indptr)
         assert indptr.size == n_features + 1
-        assert indptr.dtype == np.uint64
+        assert indptr.dtype == "uint64"
 
         i_data = json.loads(c_sdata.value)
         data = from_array_interface(i_data)
-        assert data.size == indptr[-1]
-        assert data.dtype == np.float32
+        assert data.size == int(indptr[-1])
+        assert data.dtype == "float32"
         return indptr, data
 
     def get_categories(self, export_to_arrow: bool = False) -> Categories:
@@ -1236,7 +1282,8 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
 
         handle = ctypes.c_void_p()
 
-        rindex = _maybe_np_slice(rindex, dtype=np.int32)
+        slice_dt: Any = np.int32 if (HAS_NUMPY and np is not None) else "int32"
+        rindex = _maybe_np_slice(rindex, dtype=slice_dt)
         _check_call(
             _LIB.XGDMatrixSliceDMatrixEx(
                 self.handle,
@@ -1287,13 +1334,8 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             "feature names",
         )
         if len(feature_names) != len(set(feature_names)):
-            values, counts = np.unique(
-                feature_names,
-                return_index=False,
-                return_inverse=False,
-                return_counts=True,
-            )
-            duplicates = [name for name, cnt in zip(values, counts) if cnt > 1]
+            counts = collections.Counter(feature_names)
+            duplicates = sorted(name for name, cnt in counts.items() if cnt > 1)
             raise ValueError(
                 f"feature_names must be unique. Duplicates found: {duplicates}"
             )
@@ -1407,7 +1449,7 @@ class _ProxyDMatrix(DMatrix):
             _LIB.XGProxyDMatrixSetDataColumnar(self.handle, data.array_interface())
         )
 
-    def _ref_data_from_csr(self, csr: scipy.sparse.csr_matrix) -> None:
+    def _ref_data_from_csr(self, csr: Any) -> None:
         """Reference data from scipy csr."""
         _LIB.XGProxyDMatrixSetDataCSR(
             self.handle,
@@ -1517,7 +1559,7 @@ class QuantileDMatrix(DMatrix, _RefMixIn):
         data_split_mode: int = 0,
     ) -> None:
         self.max_bin = max_bin
-        self.missing = missing if missing is not None else np.nan
+        self.missing = missing if missing is not None else math.nan
         self.nthread = nthread if nthread is not None else -1
         self._silent = silent  # unused, kept for compatibility
 
@@ -1670,7 +1712,7 @@ class ExtMemQuantileDMatrix(DMatrix, _RefMixIn):
 
         """
         self.max_bin = max_bin
-        self.missing = missing if missing is not None else np.nan
+        self.missing = missing if missing is not None else math.nan
         self.nthread = nthread if nthread is not None else -1
 
         self._init(
@@ -1727,9 +1769,13 @@ class ExtMemQuantileDMatrix(DMatrix, _RefMixIn):
             self.ref = weakref.ref(ref)
 
 
-PlainObj = Callable[[np.ndarray, DMatrix], Tuple[np.ndarray, np.ndarray]]
+if TYPE_CHECKING:
+    PlainObj = Callable[[np.ndarray, DMatrix], Tuple[np.ndarray, np.ndarray]]
+    Metric = Callable[[np.ndarray, DMatrix], Tuple[str, float]]
+else:
+    PlainObj = Callable[[ArrayLike, DMatrix], Tuple[ArrayLike, ArrayLike]]
+    Metric = Callable[[ArrayLike, DMatrix], Tuple[str, float]]
 CustomObj = Union[PlainObj, Objective]
-Metric = Callable[[np.ndarray, DMatrix], Tuple[str, float]]
 
 
 def _configure_metrics(params: BoosterParam) -> BoosterParam:
@@ -1824,7 +1870,9 @@ class Booster:
     def _prepare_parameters(params: Iterable[Tuple[str, Any]]) -> List[Tuple[str, str]]:
         prepared = []
         for key, val in params:
-            if isinstance(val, np.ndarray):
+            if (HAS_NUMPY and np is not None and isinstance(val, np.ndarray)) or isinstance(
+                val, MetalArray
+            ):
                 val = val.tolist()
             elif hasattr(val, "__cuda_array_interface__") and hasattr(val, "tolist"):
                 val = val.tolist()
@@ -1938,7 +1986,10 @@ class Booster:
 
         """
         # convert to slice for all other types
-        if isinstance(val, (np.integer, int)):
+        int_types: Tuple[Type, ...] = (
+            (int, np.integer) if (HAS_NUMPY and np is not None) else (int,)
+        )
+        if isinstance(val, int_types) and not isinstance(val, bool):
             val = slice(int(val), int(val + 1))
         if isinstance(val, EllipsisType):
             val = slice(0, 0)
@@ -1946,7 +1997,7 @@ class Booster:
             raise ValueError("Only supports slicing through 1 dimension.")
         # All supported types are now slice
         if not isinstance(val, slice):
-            msg = _expect((int, slice, np.integer, EllipsisType), type(val))
+            msg = _expect((*int_types, slice, EllipsisType), type(val))
             raise TypeError(msg)
 
         if isinstance(val.start, EllipsisType) or val.start is None:
@@ -2451,6 +2502,7 @@ class Booster:
         training: bool = False,
         iteration_range: IterationRange = (0, 0),
         strict_shape: bool = False,
+        _metal_proba: bool = False,
     ) -> np.ndarray:
         """Predict with data.  The full model will be used unless `iteration_range` is
         specified, meaning users have to either slice the model or use the
@@ -2537,13 +2589,15 @@ class Booster:
         if validate_features:
             fn = data.feature_names
             self._validate_features(fn)
-        args = {
+        args: Dict[str, Any] = {
             "type": 0,
             "training": training,
             "iteration_begin": int(iteration_range[0]),
             "iteration_end": int(iteration_range[1]),
             "strict_shape": strict_shape,
         }
+        if _metal_proba:
+            args["metal_proba"] = True
 
         def assign_type(t: int) -> None:
             if args["type"] != 0:
@@ -2573,6 +2627,90 @@ class Booster:
         )
         return _prediction_output(shape, dims, preds, False)
 
+    @_deprecate_positional_args
+    def predict_to_buffer(
+        self,
+        data: DMatrix,
+        out: Any,
+        *,
+        output_margin: bool = False,
+        pred_leaf: bool = False,
+        pred_contribs: bool = False,
+        approx_contribs: bool = False,
+        pred_interactions: bool = False,
+        validate_features: bool = True,
+        training: bool = False,
+        iteration_range: IterationRange = (0, 0),
+        strict_shape: bool = False,
+        _metal_proba: bool = False,
+    ) -> Tuple[int, ...]:
+        """Write predictions directly into a caller-owned writable float32 PEP 3118
+        buffer (`MetalArray`, `np.ndarray`, `array.array('f')`, or `memoryview`)
+        without intermediate NumPy allocations and return the output shape tuple."""
+        if not isinstance(data, DMatrix):
+            raise TypeError("Expecting data to be a DMatrix object, got: ", type(data))
+        if validate_features:
+            fn = data.feature_names
+            self._validate_features(fn)
+        args: Dict[str, Any] = {
+            "type": 0,
+            "training": training,
+            "iteration_begin": int(iteration_range[0]),
+            "iteration_end": int(iteration_range[1]),
+            "strict_shape": strict_shape,
+        }
+        if _metal_proba:
+            args["metal_proba"] = True
+
+        def assign_type(t: int) -> None:
+            if args["type"] != 0:
+                raise ValueError("One type of prediction at a time.")
+            args["type"] = t
+
+        if output_margin:
+            assign_type(1)
+        if pred_contribs:
+            assign_type(2 if not approx_contribs else 3)
+        if pred_interactions:
+            assign_type(4 if not approx_contribs else 5)
+        if pred_leaf:
+            assign_type(6)
+
+        mv = memoryview(out)
+        if mv.readonly:
+            raise ValueError("Output buffer for predict_to_buffer must be writable.")
+        if not mv.c_contiguous:
+            raise ValueError("Output buffer for predict_to_buffer must be C-contiguous.")
+        fmt = mv.format.lstrip("@=<|") if mv.format else ""
+        if mv.itemsize != 4 or fmt != "f":
+            raise TypeError(
+                f"Output buffer for predict_to_buffer must be float32 ('f'), got format={mv.format!r}."
+            )
+        capacity = mv.nbytes // 4
+        if mv.nbytes > 0:
+            raw_mv = mv.cast("B")
+            out_ptr = ctypes.cast(
+                ctypes.byref(ctypes.c_char.from_buffer(raw_mv)),
+                ctypes.POINTER(ctypes.c_float),
+            )
+        else:
+            out_ptr = ctypes.POINTER(ctypes.c_float)()
+
+        shape = ctypes.POINTER(c_bst_ulong)()
+        dims = c_bst_ulong()
+        _check_call(
+            _LIB.XGBoosterPredictToBuffer(
+                self.handle,
+                data.handle,
+                from_pystr_to_cstr(json.dumps(args)),
+                out_ptr,
+                c_bst_ulong(capacity),
+                ctypes.byref(shape),
+                ctypes.byref(dims),
+            )
+        )
+        return tuple(int(shape[i]) for i in range(dims.value))
+
     # pylint: disable=too-many-statements
     @_deprecate_positional_args
     def inplace_predict(
@@ -2581,7 +2719,7 @@ class Booster:
         *,
         iteration_range: IterationRange = (0, 0),
         predict_type: str = "value",
-        missing: float = np.nan,
+        missing: float = math.nan,
         validate_features: bool = True,
         base_margin: Any = None,
         strict_shape: bool = False,
@@ -2644,6 +2782,7 @@ class Booster:
         # once caching is supported, we can pass id(data) as cache id.
         args = make_jcargs(
             type=1 if predict_type == "margin" else 0,
+            metal_proba=bool(predict_type == "proba"),
             training=False,
             iteration_begin=int(iteration_range[0]),
             iteration_end=int(iteration_range[1]),
@@ -2702,7 +2841,7 @@ class Booster:
             if validate_features:
                 self._validate_features(fns)
         if _is_list(data) or _is_tuple(data):
-            data = np.array(data)
+            data = np.array(data) if (HAS_NUMPY and np is not None) else MetalArray.from_list(data)
 
         if validate_features:
             if not hasattr(data, "shape"):
@@ -2716,12 +2855,69 @@ class Booster:
                     f"got {data.shape[1]}"
                 )
 
+        if isinstance(data, MetalArray):
+            desc = data.to_descriptor()
+            _check_call(
+                _LIB.XGBoosterPredictFromBufferDescriptor(
+                    self.handle,
+                    ctypes.byref(desc),
+                    args,
+                    p_handle,
+                    ctypes.byref(shape),
+                    ctypes.byref(dims),
+                    ctypes.byref(preds),
+                )
+            )
+            return _prediction_output(shape, dims, preds, False)
+
+        if (
+            HAS_NUMPY
+            and np is not None
+            and type(data) is np.ndarray
+            and data.dtype.isnative
+            and data.flags.aligned
+            and not array_hasobject(data)
+        ):
+            pep_pred = try_buffer_descriptor(data, allow_1d=False)
+            if pep_pred is not None:
+                desc_np, owner_np = pep_pred
+                _ = owner_np
+                _check_call(
+                    _LIB.XGBoosterPredictFromBufferDescriptor(
+                        self.handle,
+                        ctypes.byref(desc_np),
+                        args,
+                        p_handle,
+                        ctypes.byref(shape),
+                        ctypes.byref(dims),
+                        ctypes.byref(preds),
+                    )
+                )
+                return _prediction_output(shape, dims, preds, False)
+
         if _is_np_array_like(data):
             data, _ = _ensure_np_dtype(data, data.dtype)
             _check_call(
                 _LIB.XGBoosterPredictFromDense(
                     self.handle,
                     array_interface(data),
+                    args,
+                    p_handle,
+                    ctypes.byref(shape),
+                    ctypes.byref(dims),
+                    ctypes.byref(preds),
+                )
+            )
+            return _prediction_output(shape, dims, preds, False)
+
+        pep_buf = try_buffer_descriptor(data, allow_1d=False)
+        if pep_buf is not None:
+            desc_b, owner_b = pep_buf
+            _ = owner_b
+            _check_call(
+                _LIB.XGBoosterPredictFromBufferDescriptor(
+                    self.handle,
+                    ctypes.byref(desc_b),
                     args,
                     p_handle,
                     ctypes.byref(shape),
@@ -2743,7 +2939,9 @@ class Booster:
                 )
             )
             return _prediction_output(shape, dims, preds, False)
-        if isinstance(data, scipy.sparse.csr_matrix):
+        from ._sparse import is_sparse_csr
+
+        if is_sparse_csr(data):
             from .data import transform_scipy_sparse
 
             data = transform_scipy_sparse(data, True)

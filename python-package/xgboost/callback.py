@@ -4,6 +4,7 @@
 """
 
 import collections
+import math
 import os
 import pickle
 from abc import ABC
@@ -20,8 +21,6 @@ from typing import (
     Union,
     cast,
 )
-
-import numpy
 
 from . import collective
 from ._typing import EvalsLog, _ScoreList
@@ -115,10 +114,11 @@ def _aggcv(rlist: List[str]) -> List[Tuple[str, float, float]]:
     msg = idx
     results = []
     for (_, name), s in sorted(cvmap.items(), key=lambda x: x[0][0]):
-        as_arr = numpy.array(s)
         if not isinstance(msg, str):
             msg = msg.decode()
-        mean, std = numpy.mean(as_arr), numpy.std(as_arr)
+        n = len(s)
+        mean = math.fsum(s) / n
+        std = math.sqrt(math.fsum((v - mean) ** 2 for v in s) / n)
         results.extend([(name, mean, std)])
     return results
 
@@ -141,6 +141,8 @@ def _allreduce_metric(score: _ART) -> _ART:
         raise ValueError(
             "xgboost.cv function should not be used in distributed environment."
         )
+    import numpy
+
     arr = numpy.array([score])
     arr = collective.allreduce(arr, collective.Op.SUM) / world
     return arr[0]
@@ -399,11 +401,11 @@ class EarlyStopping(TrainingCallback):
 
         def maximize(new: _Score, best: _Score) -> bool:
             """New score should be greater than the old one."""
-            return numpy.greater(get_s(new) - self._min_delta, get_s(best))
+            return bool((get_s(new) - self._min_delta) > get_s(best))
 
         def minimize(new: _Score, best: _Score) -> bool:
             """New score should be lesser than the old one."""
-            return numpy.greater(get_s(best) - self._min_delta, get_s(new))
+            return bool((get_s(best) - self._min_delta) > get_s(new))
 
         if self.maximize is None:
             # Just to be compatibility with old behavior before 1.3.  We should let

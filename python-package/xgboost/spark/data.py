@@ -19,7 +19,11 @@ from typing import (
 )
 
 import numpy as np
-from scipy.sparse import csr_matrix
+
+try:
+    from scipy.sparse import csr_matrix
+except ImportError:
+    from .._sparse import CSRMatrix as csr_matrix
 
 from .._typing import ArrayLike
 from ..compat import concat, import_cudf

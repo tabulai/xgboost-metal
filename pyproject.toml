@@ -9,7 +9,7 @@ description = "GPU-accelerated gradient boosting for Apple silicon with the XGBo
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
-dependencies = ["numpy", "scipy"]
+dependencies = []
 
 [project.urls]
 Repository = "https://github.com/tabulai/xgboost-metal"
@@ -17,8 +17,10 @@ Documentation = "https://github.com/tabulai/xgboost-metal#documentation"
 Issues = "https://github.com/tabulai/xgboost-metal/issues"
 
 [project.optional-dependencies]
-sklearn = ["scikit-learn", "pandas"]
-test = ["pytest", "scikit-learn", "pandas", "pyarrow"]
+numpy = ["numpy>=1.26.0"]
+sklearn = ["numpy>=1.26.0", "scikit-learn", "pandas"]
+all = ["numpy>=1.26.0", "scikit-learn", "pandas", "pyarrow"]
+test = ["pytest", "numpy>=1.26.0", "scikit-learn", "pandas", "pyarrow"]
 
 [tool.scikit-build]
 wheel.packages = ["python-package/xgboost"]

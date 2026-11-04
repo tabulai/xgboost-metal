@@ -157,7 +157,8 @@ def test_ineligible_paths_keep_original_division(case):
         params["subsample"] = 0.7
     else:
         bins = 257
-    compare(X, y, bins=bins, params=params, metadata=metadata, expected_active=0, rounds=2)
+    compare(X, y, bins=bins, params=params, metadata=metadata,
+            expected_active=int(case in ("monotone", "sampling")), rounds=2)
 
 
 @pytest.mark.parametrize("control_fusion,histogram_missing,gradient_fusion",

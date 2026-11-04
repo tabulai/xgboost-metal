@@ -24,7 +24,7 @@ Learner::SampledGradients Learner::sample_gradients(Buffer const& gradient, Samp
   auto size = checked_product(rows, targets);
   auto values = buffer("values", checked_product(size, sizeof(Pair)));
   auto quantized = buffer("quantized", checked_product(size, 2 * sizeof(std::int64_t)));
-  auto scales = buffer("scales", checked_product(targets, sizeof(Pair)));
+  auto scales = buffer("scales", checked_product(targets, sizeof(Pair) + sizeof(GradCert)));
   auto magnitude = sampling_buffer("magnitude", p.method && p.sample_rows ? checked_product(rows, sizeof(float)) : 0);
   auto threshold = sampling_buffer("threshold", sizeof(float));
   Command command("row sampling", integer("metal_coalesce_encoders", 0), integer("metal_compute_fill", 0));
@@ -35,11 +35,26 @@ Learner::SampledGradients Learner::sample_gradients(Buffer const& gradient, Samp
     auto first = sampling_buffer("sort_a", checked_product(stride, sizeof(Pair)));
     auto second = sampling_buffer("sort_b", first.size());
     auto prefix = sampling_buffer("prefix", checked_product(rows, sizeof(float)));
-    command.dispatch("sampling_magnitudes", {gradient, magnitude, first}, p, {stride / 256, 1, 1});
-    for (std::size_t width = 256; width < stride; width *= 2) {
-      SortParams sort{rows, 1, static_cast<u32>(stride), static_cast<u32>(width)};
-      command.dispatch("merge_sorted", {first, second}, sort, {div_up(stride, 256), 1, 1});
+    if (rows > 256) {
+      auto radix_tiles = static_cast<u32>(div_up(rows, kRadixTileRows));
+      auto spine = buffer("radix_spine", checked_product(256u, radix_tiles) * sizeof(u32));
+      auto digit_totals = buffer("radix_digits", 256u * sizeof(u32));
+      for (u32 pass = 0; pass < 4; ++pass) {
+        RadixParams rp{rows, 1u, radix_tiles, pass * 8u};
+        if (pass == 0) {
+          command.dispatch("sampling_radix_init", {gradient, magnitude, first, spine}, p, {radix_tiles, 1, 1});
+        } else {
+          command.dispatch("radix_histogram", {first, spine}, rp, {radix_tiles, 1, 1});
+        }
+        command.dispatch("radix_scan_spine", {spine, digit_totals}, rp, {256, 1, 1});
+        command.dispatch("radix_scatter", {first, second, spine, digit_totals}, rp, {radix_tiles, 1, 1});
+        std::swap(first, second);
+      }
+      RadixParams rp{rows, 1u, radix_tiles, 0u};
+      command.dispatch("sampling_radix_unpack", {first, second}, rp, {div_up(rows, 256), 1, 1});
       std::swap(first, second);
+    } else {
+      command.dispatch("sampling_magnitudes", {gradient, magnitude, first}, p, {stride / 256, 1, 1});
     }
     // CPU uses a sequential float32 partial_sum. Keep that accumulation order
     // on the GPU; CUDA's fixed-point scan can select a different threshold.

@@ -19,14 +19,27 @@ Buffer Learner::survival_order(Command& command, Matrix const& data) {
     auto matrix = entry.matrix.lock();
     return !matrix || matrix.get() == &data;
   });
-  Buffer source(checked_product(data.rows, sizeof(u32))), destination(source.size());
-  SortParams p{data.rows, 1, data.rows, 256};
-  command.dispatch("survival_order_tiles", {data.labels, source}, p, {div_up(data.rows, 256), 1, 1});
-  for (std::uint64_t width = 256; width < data.rows; width *= 2) {
-    p.width = static_cast<u32>(width);
-    command.dispatch("survival_order_merge", {data.labels, source, destination}, p,
-                     {div_up(data.rows, 256), 1, 1});
-    std::swap(source, destination);
+  Buffer source(checked_product(data.rows, sizeof(u32)));
+  if (data.rows > 256) {
+    auto radix_tiles = static_cast<u32>(div_up(data.rows, kRadixTileRows));
+    Buffer keys_a(checked_product(data.rows, 2 * sizeof(u32))), keys_b(keys_a.size());
+    Buffer spine(checked_product(256u, radix_tiles) * sizeof(u32)), digit_totals(256u * sizeof(u32));
+    for (u32 pass = 0; pass < 4; ++pass) {
+      RadixParams rp{data.rows, 1u, radix_tiles, pass * 8u};
+      if (pass == 0) {
+        command.dispatch("survival_radix_init", {data.labels, keys_a, spine}, rp, {radix_tiles, 1, 1});
+      } else {
+        command.dispatch("radix_histogram", {keys_a, spine}, rp, {radix_tiles, 1, 1});
+      }
+      command.dispatch("radix_scan_spine", {spine, digit_totals}, rp, {256, 1, 1});
+      command.dispatch("radix_scatter", {keys_a, keys_b, spine, digit_totals}, rp, {radix_tiles, 1, 1});
+      std::swap(keys_a, keys_b);
+    }
+    RadixParams rp{data.rows, 1u, radix_tiles, 0u};
+    command.dispatch("radix_extract_payload", {keys_a, source}, rp, {div_up(data.rows, 256), 1, 1});
+  } else {
+    SortParams p{data.rows, 1, data.rows, 256};
+    command.dispatch("survival_order_tiles", {data.labels, source}, p, {div_up(data.rows, 256), 1, 1});
   }
   survival_orders_.push_back({data.weak_from_this(), data.generation, source});
   return source;

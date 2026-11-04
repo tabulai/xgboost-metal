@@ -99,7 +99,8 @@ def test_dense_fallbacks_retain_original_kernel(case):
         params["monotone_constraints"] = "(1,0,0,0,0,0,0)"
     else:
         params["subsample"] = 0.7
-    compare(X, y, bins=bins, params=params, expected_active=0, rounds=2)
+    compare(X, y, bins=bins, params=params,
+            expected_active=int(case in ("monotone", "sampling")), rounds=2)
 
 
 @pytest.mark.parametrize("case", ["empty", "constant"])

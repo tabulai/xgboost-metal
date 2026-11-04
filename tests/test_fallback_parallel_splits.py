@@ -130,22 +130,22 @@ def test_host_compact_default_follows_missing_input_at_both_depths(missing, dept
 
 
 @pytest.mark.parametrize("params", [
-    pytest.param({"max_depth": 11}, id="deep"),
-    pytest.param({"monotone_constraints": "(1,0,-1,0,0,0,0)"}, id="monotone"),
-    pytest.param({"interaction_constraints": "[[0,1,2],[3,4,5,6]]"}, id="interaction"),
-    pytest.param({"colsample_bytree": 0.8, "colsample_bylevel": 0.7,
+    pytest.param({"metal_gpu_tree": 1, "max_depth": 11}, id="deep"),
+    pytest.param({"metal_gpu_tree": 0, "monotone_constraints": "(1,0,-1,0,0,0,0)"}, id="monotone"),
+    pytest.param({"metal_gpu_tree": 1, "interaction_constraints": "[[0,1,2],[3,4,5,6]]"}, id="interaction"),
+    pytest.param({"metal_gpu_tree": 0, "colsample_bytree": 0.8, "colsample_bylevel": 0.7,
                   "colsample_bynode": 0.6, "seed_per_iteration": True}, id="column-masks"),
-    pytest.param({"subsample": 0.63}, id="uniform-sampling"),
-    pytest.param({"subsample": 0.63, "sampling_method": "gradient_based"}, id="gradient-sampling"),
-    pytest.param({"grow_policy": "lossguide", "max_depth": 0,
+    pytest.param({"metal_gpu_tree": 0, "subsample": 0.63}, id="uniform-sampling"),
+    pytest.param({"metal_gpu_tree": 0, "subsample": 0.63, "sampling_method": "gradient_based"}, id="gradient-sampling"),
+    pytest.param({"metal_gpu_tree": 1, "grow_policy": "lossguide", "max_depth": 0,
                   "max_leaves": 17, "max_cached_hist_node": 1}, id="lossguide-eviction"),
-    pytest.param({"max_cached_hist_node": 1}, id="depthwise-eviction"),
-    pytest.param({"metal_partition_scan": 0}, id="atomic-partition"),
-    pytest.param({"metal_fused_partition": 0}, id="separate-partition"),
+    pytest.param({"metal_gpu_tree": 1, "max_cached_hist_node": 1}, id="depthwise-eviction"),
+    pytest.param({"metal_gpu_tree": 1, "metal_partition_scan": 0}, id="atomic-partition"),
+    pytest.param({"metal_gpu_tree": 1, "metal_fused_partition": 0}, id="separate-partition"),
 ])
 def test_host_constraints_sampling_and_cache_rebuilds(params):
     X, y = inputs(rows=769, density=0.65)
-    compare(X, y, bins=256, rounds=3, params={"metal_gpu_tree": 1, **params},
+    compare(X, y, bins=256, rounds=3, params=params,
             allow_root_only="colsample_bynode" in params,
             metadata={"weight": np.linspace(0.1, 1.7, len(y), dtype=np.float32),
                       "feature_weights": np.arange(1, 8, dtype=np.float32)})
@@ -213,7 +213,7 @@ def test_sampled_multiclass_parallel_trees_keep_compact_group_index(sampling):
     X, _ = inputs(rows=769, density=0.6)
     y = (np.arange(len(X)) % 3).astype(np.float32)
     compare(X, y, bins=128, rounds=2,
-            params={"metal_gpu_tree": 1, "objective": "multi:softprob", "num_class": 3,
+            params={"metal_gpu_tree": 0, "objective": "multi:softprob", "num_class": 3,
                     "num_parallel_tree": 2, "subsample": 0.63,
                     "sampling_method": sampling, "seed_per_iteration": True})
 

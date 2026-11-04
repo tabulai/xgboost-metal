@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <mach/vm_page_size.h>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -63,6 +64,12 @@ Runtime::Runtime() : impl_(std::make_unique<Impl>()) {
 Runtime::~Runtime() = default;
 void* Runtime::device() const { return (void*)impl_->device; }
 void* Runtime::queue() const { return (void*)impl_->queue; }
+void const* Runtime::shared_mtl_buffer_contents(void* mtl_buffer) {
+  if (!mtl_buffer) return nullptr;
+  id<MTLBuffer> buf = (id<MTLBuffer>)mtl_buffer;
+  if ([buf storageMode] != MTLStorageModeShared) return nullptr;
+  return [buf contents];
+}
 void* Runtime::pipeline(std::string_view name) {
   std::lock_guard lock(impl_->mutex);
   if (auto it = impl_->pipelines.find(name); it != impl_->pipelines.end()) return (void*)it->second;
@@ -105,6 +112,73 @@ Buffer::Buffer(std::size_t bytes) : bytes_(bytes) {
 }
 Buffer::Buffer(void const* data, std::size_t bytes) : Buffer(bytes) {
   if (bytes) std::memcpy(this->data(), data, bytes);
+}
+std::size_t Buffer::page_size() { return static_cast<std::size_t>(vm_page_size); }
+Buffer Buffer::view_readonly(void const* data, std::size_t bytes, bool* zero_copied) {
+  if (zero_copied) *zero_copied = false;
+  if (!data || !bytes) return Buffer(bytes);
+  auto const page = static_cast<std::size_t>(vm_page_size);
+  auto const addr = reinterpret_cast<std::uintptr_t>(data);
+  if (page && (addr % page) == 0 && (bytes % page) == 0) {
+    @autoreleasepool {
+      id<MTLDevice> device = (id<MTLDevice>)Runtime::get().device();
+      if (bytes <= [device maxBufferLength]) {
+        id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:const_cast<void*>(data)
+                                                         length:bytes
+                                                        options:MTLResourceStorageModeShared
+                                                    deallocator:nil];
+        if (buffer) {
+          if (zero_copied) *zero_copied = true;
+          Buffer result;
+          result.bytes_ = bytes;
+          result.object_ = std::shared_ptr<void>((void*)buffer, [](void* p) { [(id<MTLBuffer>)p release]; });
+          return result;
+        }
+      }
+    }
+  }
+  return Buffer(data, bytes);
+}
+Buffer Buffer::view_subrange_readonly(void const* data, std::size_t bytes,
+                                      std::size_t& byte_offset, bool* zero_copied,
+                                      bool prefer_zero_copy) {
+  byte_offset = 0;
+  if (zero_copied) *zero_copied = false;
+  if (!data || !bytes) return Buffer(bytes);
+  auto const page = static_cast<std::size_t>(vm_page_size);
+  // Wrap sub-page spans when page-aligned, explicitly flagged (e.g. MetalArray / kDLMetal),
+  // or large enough (>= 64 KiB) to amortize VM page pinning.
+  auto const addr = reinterpret_cast<std::uintptr_t>(data);
+  bool page_aligned_start = page && (addr % page) == 0;
+  if (page && (prefer_zero_copy || page_aligned_start || bytes >= 4 * page)) {
+    auto const aligned_base = addr & ~(static_cast<std::uintptr_t>(page) - 1);
+    auto const end_addr = addr + bytes;
+    if (end_addr >= addr) {
+      auto const rem = end_addr % page;
+      auto const aligned_end = rem ? (end_addr + (page - rem)) : end_addr;
+      if (aligned_end >= end_addr) {
+        auto const aligned_len = static_cast<std::size_t>(aligned_end - aligned_base);
+        @autoreleasepool {
+          id<MTLDevice> device = (id<MTLDevice>)Runtime::get().device();
+          if (aligned_len <= [device maxBufferLength]) {
+            id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:reinterpret_cast<void*>(aligned_base)
+                                                             length:aligned_len
+                                                            options:MTLResourceStorageModeShared
+                                                        deallocator:nil];
+            if (buffer) {
+              byte_offset = static_cast<std::size_t>(addr - aligned_base);
+              if (zero_copied) *zero_copied = true;
+              Buffer result;
+              result.bytes_ = aligned_len;
+              result.object_ = std::shared_ptr<void>((void*)buffer, [](void* p) { [(id<MTLBuffer>)p release]; });
+              return result;
+            }
+          }
+        }
+      }
+    }
+  }
+  return Buffer(data, bytes);
 }
 void* Buffer::data() const { return object_ ? [(id<MTLBuffer>)object_.get() contents] : nullptr; }
 Buffer Buffer::prefix(std::size_t bytes) const {

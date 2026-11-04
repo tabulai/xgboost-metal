@@ -139,7 +139,8 @@ def test_ineligible_paths_keep_original_gain(case):
         bins = 256
     else:
         bins = 257
-    compare(X, y, bins=bins, params=params, metadata=metadata, expected_active=0, rounds=2)
+    compare(X, y, bins=bins, params=params, metadata=metadata,
+            expected_active=int(case in ("monotone", "sampling")), rounds=2)
 
 
 @pytest.mark.parametrize("control,gradient", [(0, 0), (1, 1)])

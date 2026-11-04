@@ -31,9 +31,10 @@ kernel void linear_weight_partial(device const float* weights [[buffer(0)]],
                                    uint block [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup SurvivalSum scratch[256];
   auto sum = survival_zero();
-  ulong end = min(ulong(p.rows), (ulong(block) + 1) * kLinearRowsPerTile);
-  for (ulong row = ulong(block) * kLinearRowsPerTile + tid; row < end; row += 256)
-    sum.value = sum.value + sr(p.has_weight ? weights[row] : 1.0f);
+  uint tile_rows = (p.has_weight >> 1) ? (p.has_weight >> 1) : kLinearRowsPerTile;
+  ulong end = min(ulong(p.rows), (ulong(block) + 1) * tile_rows);
+  for (ulong row = ulong(block) * tile_rows + tid; row < end; row += 256)
+    sum.value = sum.value + sr((p.has_weight & 1u) ? weights[row] : 1.0f);
   auto total = survival_block_reduce(sum, scratch, tid);
   if (!tid) partial[block] = total;
 }
@@ -47,15 +48,17 @@ kernel void linear_weight_total(device const SurvivalSum* partial [[buffer(0)]],
   if (!tid) mass[0] = total.value;
 }
 kernel void linear_partial(device const float* data [[buffer(0)]], device const Pair* gradient [[buffer(1)]],
-                            device SurvivalSum* partial [[buffer(2)]], constant LinearParams& p [[buffer(3)]],
+                            device SurvivalSum* partial [[buffer(2)]], device const uint* feature_order [[buffer(3)]],
+                            constant LinearParams& p [[buffer(4)]],
                             uint2 block [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   #pragma clang fp contract(off)
   threadgroup SurvivalSum scratch[256];
-  uint feature = p.all_features ? block.y : p.feature;
+  uint feature = (p.all_features & 1u) ? block.y : ((p.all_features & 2u) ? feature_order[ulong(p.group) * p.cols + p.feature] : p.feature);
   bool bias = feature == p.cols;
   auto sum = survival_zero();
-  ulong end = min(ulong(p.rows), (ulong(block.x) + 1) * kLinearRowsPerTile);
-  for (ulong row = ulong(block.x) * kLinearRowsPerTile + tid; row < end; row += 256) {
+  uint tile_rows = (p.has_weight >> 1) ? (p.has_weight >> 1) : kLinearRowsPerTile;
+  ulong end = min(ulong(p.rows), (ulong(block.x) + 1) * tile_rows);
+  for (ulong row = ulong(block.x) * tile_rows + tid; row < end; row += 256) {
     auto pair = gradient[row * p.groups + p.group];
     if (bias) {
       if (pair.h >= 0) sum = sum + SurvivalSum{sr(pair.g), sr(pair.h)};
@@ -72,14 +75,15 @@ kernel void linear_partial(device const float* data [[buffer(0)]], device const 
 kernel void linear_reduce(device const SurvivalSum* partial [[buffer(0)]], device float* weights [[buffer(1)]],
                            device const SurvivalReal* mass [[buffer(2)]], device SurvivalReal* deltas [[buffer(3)]],
                            device float* scores [[buffer(4)]], device LinearUpdate* update [[buffer(5)]],
-                           constant LinearParams& p [[buffer(6)]],
+                           device const uint* feature_order [[buffer(6)]],
+                           constant LinearParams& p [[buffer(7)]],
                            uint block [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   threadgroup SurvivalSum scratch[256];
   auto sum = survival_zero();
   for (uint i = tid; i < p.tiles; i += 256) sum = sum + partial[ulong(block) * p.tiles + i];
   auto total = survival_block_reduce(sum, scratch, tid);
   if (tid) return;
-  uint feature = p.all_features ? block : p.feature;
+  uint feature = (p.all_features & 1u) ? block : ((p.all_features & 2u) ? feature_order[ulong(p.group) * p.cols + p.feature] : p.feature);
   auto delta = sr(0);
   if (feature == p.cols) {
     delta = -total.value / total.weight;
@@ -89,7 +93,7 @@ kernel void linear_reduce(device const SurvivalSum* partial [[buffer(0)]], devic
     float lambda = extended_result(sr(p.reg_lambda) * mass[0]);
     delta = linear_delta(total, weights[ulong(feature) * p.groups + p.group], alpha, lambda);
   }
-  if (p.all_features) {
+  if (p.all_features & 1u) {
     ulong index = ulong(p.group) * p.cols + feature;
     deltas[index] = delta;
     scores[index] = extended_result(delta);
@@ -144,6 +148,89 @@ kernel void linear_residual(device const float* data [[buffer(0)]], device Pair*
     change = (pair.h * value) * update->value;
   }
   gradient[index].g = pair.g + change;
+}
+kernel void linear_thrifty_sort(device const float* scores [[buffer(0)]],
+                                device uint* order [[buffer(1)]],
+                                constant LinearParams& p [[buffer(2)]],
+                                uint group [[threadgroup_position_in_grid]],
+                                uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float s_key[2048];
+  threadgroup uint s_idx[2048];
+  if (group >= p.groups || p.cols == 0) return;
+  uint n_pow2 = 2;
+  while (n_pow2 < p.cols && n_pow2 < 2048) n_pow2 <<= 1;
+  ulong base = ulong(group) * p.cols;
+  for (uint i = tid; i < n_pow2; i += 256) {
+    s_key[i] = i < p.cols ? fabs(scores[base + i]) : -1.0f;
+    s_idx[i] = i;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint k = 2; k <= n_pow2; k <<= 1) {
+    for (uint j = k >> 1; j > 0; j >>= 1) {
+      for (uint t = tid; t < (n_pow2 >> 1); t += 256) {
+        uint ix = ((t / j) * (2 * j)) + (t % j);
+        uint iy = ix ^ j;
+        bool asc = (ix & k) != 0;
+        float ka = s_key[ix], kb = s_key[iy];
+        uint ia = s_idx[ix], ib = s_idx[iy];
+        bool a_better = (ka > kb) || (ka == kb && ia < ib);
+        if (asc ? a_better : !a_better) {
+          s_key[ix] = kb; s_key[iy] = ka;
+          s_idx[ix] = ib; s_idx[iy] = ia;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  for (uint i = tid; i < p.cols; i += 256) order[base + i] = s_idx[i];
+}
+kernel void linear_coord_fused(device const float* data [[buffer(0)]],
+                               device Pair* gradient [[buffer(1)]],
+                               device float* weights [[buffer(2)]],
+                               device const SurvivalReal* mass [[buffer(3)]],
+                               device const uint* feature_order [[buffer(4)]],
+                               constant LinearParams& p [[buffer(5)]],
+                               uint group [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+  #pragma clang fp contract(off)
+  threadgroup SurvivalSum scratch[256];
+  threadgroup float s_dw;
+  if (group >= p.groups) return;
+  float alpha = extended_result(sr(p.reg_alpha) * mass[0]);
+  float lambda = extended_result(sr(p.reg_lambda) * mass[0]);
+  uint steps = p.feature;
+  for (uint step = 0; step < steps; ++step) {
+    uint feature = feature_order[ulong(group) * p.cols + step];
+    auto sum = survival_zero();
+    for (ulong row = tid; row < p.rows; row += 256) {
+      auto pair = gradient[row * p.groups + group];
+      float value = data[ulong(feature) * p.rows + row];
+      if (isnan(value) || pair.h < 0) continue;
+      float g = pair.g * value, h = (pair.h * value) * value;
+      sum = sum + SurvivalSum{sr(g), sr(h)};
+    }
+    auto total = survival_block_reduce(sum, scratch, tid);
+    if (!tid) {
+      ulong w_idx = ulong(feature) * p.groups + group;
+      auto delta = linear_delta(total, weights[w_idx], alpha, lambda);
+      float dw = extended_result(sr(p.learning_rate) * delta);
+      weights[w_idx] += dw;
+      s_dw = dw;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float dw = s_dw;
+    if (dw != 0) {
+      for (ulong row = tid; row < p.rows; row += 256) {
+        ulong idx = row * p.groups + group;
+        auto pair = gradient[idx];
+        if (pair.h < 0) continue;
+        float value = data[ulong(feature) * p.rows + row];
+        if (isnan(value)) continue;
+        gradient[idx].g = pair.g + (pair.h * value) * dw;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+  }
 }
 kernel void linear_convergence(device const float* weights [[buffer(0)]], device float* previous [[buffer(1)]],
                                 device uint* converged [[buffer(2)]], constant LinearParams& p [[buffer(3)]],

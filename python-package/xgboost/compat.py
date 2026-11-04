@@ -3,15 +3,21 @@
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import importlib.util
 import logging
 import types
 from typing import TYPE_CHECKING, Any, Sequence, TypeGuard, cast
 
-import numpy as np
+from ._metal_array import MetalArray
+from ._sparse import is_any_host_sparse, sparse_vstack
+from ._typing import _T, HAS_NUMPY, DataType
 
-from ._typing import _T, DataType
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -163,12 +169,6 @@ def is_pandas_available() -> bool:
     return True
 
 
-try:
-    import scipy.sparse as scipy_sparse
-except ImportError:
-    scipy_sparse = False
-
-
 def _is_polars_lazyframe(data: DataType) -> bool:
     return lazy_isinstance(data, "polars.lazyframe.frame", "LazyFrame")
 
@@ -257,16 +257,27 @@ def _is_cupy_alike(data: DataType) -> bool:
 
 def concat(value: Sequence[_T]) -> _T:  # pylint: disable=too-many-return-statements
     """Concatenate row-wise."""
-    if isinstance(value[0], np.ndarray):
+    if HAS_NUMPY and np is not None and isinstance(value[0], np.ndarray):
         value_arr = cast(Sequence[np.ndarray], value)
         return cast(_T, np.concatenate(value_arr, axis=0))
-    if scipy_sparse and isinstance(value[0], scipy_sparse.csr_matrix):
-        return scipy_sparse.vstack(value, format="csr")
-    if scipy_sparse and isinstance(value[0], scipy_sparse.csc_matrix):
-        return scipy_sparse.vstack(value, format="csc")
-    if scipy_sparse and isinstance(value[0], scipy_sparse.spmatrix):
-        # other sparse format will be converted to CSR.
-        return scipy_sparse.vstack(value, format="csr")
+    if isinstance(value[0], MetalArray):
+        blocks = [cast(MetalArray, v).contiguous() for v in value]
+        first = blocks[0]
+        trailing = first.shape[1:]
+        total_rows = 0
+        for blk in blocks:
+            if blk.shape[1:] != trailing or blk.dtype != first.dtype:
+                raise ValueError("Incompatible MetalArray shapes or dtypes in concat.")
+            total_rows += blk.shape[0]
+        out = MetalArray.empty((total_rows, *trailing), dtype=first.dtype)
+        offset_bytes = 0
+        for blk in blocks:
+            if blk.nbytes > 0:
+                ctypes.memmove(out.data_ptr + offset_bytes, blk.data_ptr, blk.nbytes)
+                offset_bytes += blk.nbytes
+        return cast(_T, out)
+    if is_any_host_sparse(value[0]):
+        return cast(_T, sparse_vstack(value))
     if _is_pandas_df(value[0]) or _is_pandas_series(value[0]):
         import pandas as pd
         from pandas import concat as pd_concat

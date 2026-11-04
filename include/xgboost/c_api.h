@@ -255,6 +255,13 @@ XGB_DLL int XGDMatrixCreateFromCSC(char const *indptr, char const *indices, char
                                    bst_ulong nrow, char const *config, DMatrixHandle *out);
 
 /**
+ * @brief Create a DMatrix directly from a COO sparse matrix on the Metal GPU.
+ */
+XGB_DLL int XGDMatrixCreateFromCOO(char const *row_idx, char const *col_idx, char const *data,
+                                   bst_ulong nrow, bst_ulong ncol, char const *config,
+                                   DMatrixHandle *out);
+
+/**
  * @brief create matrix content from dense matrix
  * @param data pointer to the data space
  * @param nrow number of rows
@@ -1851,4 +1858,42 @@ XGB_DLL int XGCommunicatorBroadcast(void *send_receive_buffer, size_t size, int 
 XGB_DLL int XGCommunicatorAllreduce(void *send_receive_buffer, size_t count, int data_type, int op);
 
 /**@}*/  // End of Collective
+
+/**
+ * @brief Binary buffer descriptor for zero-JSON PEP 3118 / unified-memory ingestion.
+ */
+typedef struct {
+  const void *data;
+  uint64_t shape[2];
+  int64_t strides[2];
+  uint32_t ndim;
+  uint32_t dtype_code;
+  const void *mask_data;
+  int64_t mask_bit_offset;
+  uint32_t mask_mode;
+  uint32_t flags;
+} XGBufferDescriptor;
+
+XGB_DLL int XGDMatrixCreateFromBufferDescriptor(XGBufferDescriptor const *desc, float missing,
+                                                DMatrixHandle *out);
+XGB_DLL int XGDMatrixCreateFromColumnarBuffers(XGBufferDescriptor const *columns, bst_ulong ncol,
+                                               float missing, DMatrixHandle *out);
+XGB_DLL int XGDMatrixSetInfoFromBufferDescriptor(DMatrixHandle handle, char const *field,
+                                                 XGBufferDescriptor const *desc);
+XGB_DLL int XGDMatrixCreateFromDLPack(void *dl_managed_tensor, int is_versioned, float missing,
+                                      DMatrixHandle *out);
+XGB_DLL int XGDMatrixCreateFromArrow(void const *arrow_schema, void const *arrow_array,
+                                     float missing, DMatrixHandle *out);
+XGB_DLL int XGBoosterPredictFromBufferDescriptor(BoosterHandle handle,
+                                                 XGBufferDescriptor const *desc, char const *config,
+                                                 DMatrixHandle proxy, bst_ulong const **out_shape,
+                                                 bst_ulong *out_dim, float const **out_result);
+XGB_DLL int XGBoosterPredictToBuffer(BoosterHandle handle, DMatrixHandle dmat, char const *config,
+                                     float *out_buffer, bst_ulong out_capacity,
+                                     bst_ulong const **out_shape, bst_ulong *out_dim);
+XGB_DLL int XGDMatrixBuildCVFolds(DMatrixHandle handle, int nfold, unsigned seed, int shuffle,
+                                  int stratified, DMatrixHandle *out_train,
+                                  DMatrixHandle *out_test);
+XGB_DLL int XGDMatrixWasZeroCopied(DMatrixHandle handle, int *out);
+
 #endif   // XGBOOST_C_API_H_

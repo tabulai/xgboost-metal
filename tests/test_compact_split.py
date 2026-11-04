@@ -145,7 +145,8 @@ def test_ineligible_paths_keep_compaction_disabled(case):
         metadata["feature_types"] = ["c"] + ["q"] * 6
     else:
         params["monotone_constraints"] = "(1,0,0,0,0,0,0)"
-    compare(X, y, bins=bins, params=params, metadata=metadata, expected_active=0, rounds=2)
+    compare(X, y, bins=bins, params=params, metadata=metadata,
+            expected_active=int(case == "monotone"), rounds=2)
 
 
 @pytest.mark.parametrize("pruned", [False, True])

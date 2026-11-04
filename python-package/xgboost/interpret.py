@@ -1,11 +1,14 @@
 """Interpretability functions for XGBoost models."""
 
-from typing import Optional, Tuple, Union
+from __future__ import annotations
 
-import numpy as np
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 from ._typing import ArrayLike, FloatCompatible, IterationRange
 from .core import Booster, DMatrix
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 def _as_booster(model: object) -> Booster:

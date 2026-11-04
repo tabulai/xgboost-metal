@@ -1,17 +1,25 @@
 """XGBoost collective communication related API."""
 
+from __future__ import annotations
+
 import ctypes
 import logging
 import os
 import pickle
 from dataclasses import dataclass
 from enum import IntEnum, unique
-from typing import Any, Callable, Dict, Optional, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, TypeAlias, Union
 
-import numpy as np
-
-from ._typing import _T
+from ._typing import _T, HAS_NUMPY
 from .core import _LIB, _check_call, build_info, c_str, make_jcargs, py_str
+
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    import numpy as np
 
 LOGGER = logging.getLogger("[xgboost.collective]")
 
@@ -236,6 +244,8 @@ def broadcast(data: _T, root: int) -> _T:
 
 # enumeration of dtypes
 def _map_dtype(dtype: np.dtype) -> int:
+    if not HAS_NUMPY or np is None:
+        raise ImportError("numpy is required for collective.allreduce.")
     dtype_map = {
         np.dtype("float16"): 0,
         np.dtype("float32"): 1,
@@ -291,6 +301,8 @@ def allreduce(data: np.ndarray, op: Op) -> np.ndarray:
     -----
     This function is not thread-safe.
     """
+    if not HAS_NUMPY or np is None:
+        raise ImportError("numpy is required for collective.allreduce.")
     if not isinstance(data, np.ndarray):
         raise TypeError("allreduce only takes in numpy.ndarray")
     buf = data.ravel().copy()

@@ -64,6 +64,11 @@ void set_feature_info(std::vector<std::string>& dest, char const** source, bst_u
   }
 }
 void check_matrix_config(Json const& config) { require(config.value("data_split_mode", 0) == 0, "Only row-wise data split is supported."); }
+int sparse_mode_from_config(Json const& config) {
+  if (config.contains("sparse_mode") && !config["sparse_mode"].is_null()) return config["sparse_mode"].get<int>();
+  if (char const* env = std::getenv("XGBOOST_METAL_SPARSE_MODE"); env && *env) return std::atoi(env);
+  return -1;
+}
 Json decode(void const* data, std::size_t size) {
   require(data && size >= 2, "Invalid empty model buffer.");
   auto p = static_cast<std::uint8_t const*>(data);
@@ -191,10 +196,13 @@ int XGDMatrixCreateFromColumnar(char const* data, char const* config, DMatrixHan
   return api([&] { auto c = parse_json(config); check_matrix_config(c); *out = new MatrixHandle(Matrix::columnar(parse_json(data), missing_value(c))); });
 }
 int XGDMatrixCreateFromCSR(char const* indptr, char const* indices, char const* data, bst_ulong columns, char const* config, DMatrixHandle* out) {
-  return api([&] { auto c = parse_json(config); check_matrix_config(c); *out = new MatrixHandle(Matrix::sparse(parse_json(indptr), parse_json(indices), parse_json(data), columns, false, missing_value(c))); });
+  return api([&] { auto c = parse_json(config); check_matrix_config(c); *out = new MatrixHandle(Matrix::sparse(parse_json(indptr), parse_json(indices), parse_json(data), columns, false, missing_value(c), sparse_mode_from_config(c))); });
 }
 int XGDMatrixCreateFromCSC(char const* indptr, char const* indices, char const* data, bst_ulong rows, char const* config, DMatrixHandle* out) {
-  return api([&] { auto c = parse_json(config); check_matrix_config(c); *out = new MatrixHandle(Matrix::sparse(parse_json(indptr), parse_json(indices), parse_json(data), rows, true, missing_value(c))); });
+  return api([&] { auto c = parse_json(config); check_matrix_config(c); *out = new MatrixHandle(Matrix::sparse(parse_json(indptr), parse_json(indices), parse_json(data), rows, true, missing_value(c), sparse_mode_from_config(c))); });
+}
+int XGDMatrixCreateFromCOO(char const* row_idx, char const* col_idx, char const* data, bst_ulong rows, bst_ulong cols, char const* config, DMatrixHandle* out) {
+  return api([&] { auto c = parse_json(config); check_matrix_config(c); *out = new MatrixHandle(Matrix::from_coo(parse_json(row_idx), parse_json(col_idx), parse_json(data), rows, cols, missing_value(c), sparse_mode_from_config(c))); });
 }
 int XGDMatrixCreateFromMat(float const* data, bst_ulong rows, bst_ulong cols, float missing, DMatrixHandle* out) {
   return api([&] { require(rows <= UINT32_MAX && cols <= UINT32_MAX, "Matrix dimensions exceed the index range."); auto n = checked_product(rows, cols); require(data || n == 0, "Null input data."); std::vector<float> v(n); if (n) std::copy_n(data, n, v.data()); *out = new MatrixHandle(std::make_shared<Matrix>(rows, cols, std::move(v), missing)); });
@@ -207,7 +215,7 @@ int XGProxyDMatrixCreate(DMatrixHandle* out) { return api([&] { auto m = std::ma
 int XGProxyDMatrixSetDataDense(DMatrixHandle h, char const* data) { return api([&] { replace_proxy(h, Matrix::dense(parse_json(data), kNaN)); }); }
 int XGProxyDMatrixSetDataColumnar(DMatrixHandle h, char const* data) { return api([&] { replace_proxy(h, Matrix::columnar(parse_json(data), kNaN)); }); }
 int XGProxyDMatrixSetDataCSR(DMatrixHandle h, char const* ip, char const* ix, char const* values, bst_ulong columns) {
-  return api([&] { replace_proxy(h, Matrix::sparse(parse_json(ip), parse_json(ix), parse_json(values), columns, false, kNaN)); });
+  return api([&] { replace_proxy(h, Matrix::sparse(parse_json(ip), parse_json(ix), parse_json(values), columns, false, kNaN, sparse_mode_from_config(Json::object()))); });
 }
 int XGProxyDMatrixSetDataCudaArrayInterface(DMatrixHandle, char const*) { return cuda_error(); }
 int XGProxyDMatrixSetDataCudaColumnar(DMatrixHandle, char const*) { return cuda_error(); }
@@ -267,8 +275,17 @@ int XGDMatrixNumRow(DMatrixHandle h, bst_ulong* out) { return api([&] { *out = m
 int XGDMatrixNumCol(DMatrixHandle h, bst_ulong* out) { return api([&] { *out = matrix(h)->cols; }); }
 int XGDMatrixNumNonMissing(DMatrixHandle h, bst_ulong* out) {
   return api([&] {
-    auto const& m = *matrix(h); auto input = m.data.as<float>(); bst_ulong count = 0;
+    auto const& m = *matrix(h);
     if (m.sparse_page && !m.is_quantile) { *out = m.sparse_page->entries.size(); return; }
+    if (m.is_sparse()) {
+      if (!m.is_quantile) { *out = m.sparse_->nnz; return; }
+      auto const* vals = m.sparse_->csr_val.as<float>();
+      bst_ulong count = 0;
+      for (u32 e = 0; e < m.sparse_->nnz; ++e) count += !std::isnan(vals[e]);
+      *out = count;
+      return;
+    }
+    auto input = m.data.as<float>(); bst_ulong count = 0;
     for (std::size_t i = 0; i < static_cast<std::size_t>(m.rows) * m.cols; ++i) count += !std::isnan(input[i]);
     *out = count;
   });
@@ -304,6 +321,29 @@ int XGDMatrixGetDataAsCSR(DMatrixHandle h, char const*, bst_ulong* indptr, unsig
       }
       return;
     }
+    if (m.is_sparse()) {
+      auto const* rp = m.sparse_->csr_row_ptr.as<u32>();
+      auto const* ci = m.sparse_->csr_col_idx.as<u32>();
+      if (!m.is_quantile) {
+        auto const* cv = m.sparse_->csr_val.as<float>();
+        for (u32 r = 0; r <= m.rows; ++r) indptr[r] = rp[r];
+        std::copy_n(ci, m.sparse_->nnz, indices);
+        std::copy_n(cv, m.sparse_->nnz, values);
+        return;
+      }
+      Buffer rep_val(checked_product(m.sparse_->nnz, sizeof(float)));
+      m.decode_quantiles(rep_val, true);
+      auto const* rv = rep_val.as<float>();
+      bst_ulong count = 0;
+      indptr[0] = 0;
+      for (u32 r = 0; r < m.rows; ++r) {
+        for (u32 e = rp[r]; e < rp[r + 1]; ++e) {
+          if (!std::isnan(rv[e])) { indices[count] = ci[e]; values[count++] = rv[e]; }
+        }
+        indptr[r + 1] = count;
+      }
+      return;
+    }
     auto data = m.export_data(); bst_ulong count = 0; indptr[0] = 0;
     auto input = data.as<float>();
     for (u32 r = 0; r < m.rows; ++r) {
@@ -328,8 +368,10 @@ int XGDMatrixCreateFromURI(char const* config, DMatrixHandle* out) {
     require(uri.find('#') == std::string::npos, "External memory training with text input has been removed.");
     if (auto binary = Matrix::load_binary(uri)) {
       if (!c.value("silent", 1) && global_config.value("verbosity", 1) >= 2) {
+        std::size_t entry_count = binary->sparse_page ? binary->sparse_page->entries.size() :
+                                  (binary->is_sparse() ? binary->sparse_->nnz : 0);
         auto text = std::to_string(binary->rows) + "x" + std::to_string(binary->cols) + " matrix with " +
-                    std::to_string(binary->sparse_page->entries.size()) + " entries loaded from " + uri;
+                    std::to_string(entry_count) + " entries loaded from " + uri;
         if (log_callback) log_callback(text.c_str()); else std::fprintf(stderr, "%s\n", text.c_str());
       }
       *out = new MatrixHandle(std::move(binary)); return;
@@ -597,5 +639,485 @@ extern "C" __attribute__((visibility("default"))) int XGBMetalValidateLeafScalin
     require(mismatches && first_mismatch, "Null validation output.");
     *first_mismatch = 0;
     *mismatches = validate_leaf_scaling(eta, begin, count, first_mismatch);
+  });
+}
+
+namespace {
+std::size_t descriptor_dtype_bytes(u32 code) {
+  switch (code) {
+    case kIngestI8: case kIngestU8: case kIngestBool: return 1;
+    case kIngestF16: case kIngestBF16: case kIngestI16: case kIngestU16: return 2;
+    case kIngestF32: case kIngestI32: case kIngestU32: return 4;
+    case kIngestF64: case kIngestI64: case kIngestU64: return 8;
+    case kIngestBoolBits: return 0;
+    default: throw std::invalid_argument("Unsupported buffer dtype code.");
+  }
+}
+
+IngestColumnSpec spec_from_descriptor(XGBufferDescriptor const& d, bool require_2d) {
+  if (require_2d) require(d.ndim == 2, "Feature data must be two dimensional.");
+  else require(d.ndim == 1 || d.ndim == 2, "Buffer descriptor must be 1D or 2D.");
+  require(d.shape[0] <= UINT32_MAX && (d.ndim == 1 || d.shape[1] <= UINT32_MAX),
+          "Matrix dimension exceeds the 32-bit row or feature index range.");
+  IngestColumnSpec spec;
+  spec.rows = static_cast<u32>(d.shape[0]);
+  spec.cols = static_cast<u32>(d.ndim == 2 ? d.shape[1] : 1);
+  spec.dtype_code = d.dtype_code;
+  auto elem_bytes = descriptor_dtype_bytes(d.dtype_code);
+  spec.data_ptr = reinterpret_cast<std::uintptr_t>(d.data);
+  spec.prefer_zero_copy = (d.flags & 2u) != 0;
+  if (d.dtype_code == kIngestBoolBits) {
+    require(spec.cols == 1, "Bit-packed boolean buffers must be 1D or single-column.");
+    spec.data_bit_offset = (d.flags & 4u) ? d.strides[0] : 0;
+    spec.stride_r = 0;
+    spec.stride_c = 0;
+  } else if (d.flags & 1u) {
+    spec.stride_c = d.ndim == 2 ? static_cast<i64>(elem_bytes) : 0;
+    spec.stride_r = d.ndim == 2 ? static_cast<i64>(checked_product(spec.cols, elem_bytes))
+                                : static_cast<i64>(elem_bytes);
+  } else {
+    spec.stride_r = d.strides[0];
+    spec.stride_c = d.ndim == 2 ? d.strides[1] : 0;
+  }
+  require(d.mask_mode <= kIngestMaskInvalidBytes, "Invalid buffer mask mode.");
+  spec.mask_mode = d.mask_mode;
+  spec.mask_ptr = reinterpret_cast<std::uintptr_t>(d.mask_data);
+  spec.mask_bit_offset = d.mask_bit_offset;
+  if (checked_product(spec.rows, spec.cols) > 0) {
+    require(spec.data_ptr != 0, "Null data pointer for a nonempty buffer.");
+    if (spec.mask_mode != kIngestMaskNone)
+      require(spec.mask_ptr != 0, "Null validity mask for a nonempty buffer.");
+  }
+  return spec;
+}
+
+struct DLDeviceABI {
+  std::int32_t device_type;
+  std::int32_t device_id;
+};
+struct DLDataTypeABI {
+  std::uint8_t code;
+  std::uint8_t bits;
+  std::uint16_t lanes;
+};
+struct DLTensorABI {
+  void* data;
+  DLDeviceABI device;
+  std::int32_t ndim;
+  DLDataTypeABI dtype;
+  std::int64_t* shape;
+  std::int64_t* strides;
+  std::uint64_t byte_offset;
+};
+struct DLManagedTensorABI {
+  DLTensorABI dl_tensor;
+  void* manager_ctx;
+  void (*deleter)(DLManagedTensorABI*);
+};
+struct DLPackVersionABI {
+  std::uint32_t major;
+  std::uint32_t minor;
+};
+struct DLManagedTensorVersionedABI {
+  DLPackVersionABI version;
+  void* manager_ctx;
+  void (*deleter)(DLManagedTensorVersionedABI*);
+  std::uint64_t flags;
+  DLTensorABI dl_tensor;
+};
+
+u32 dlpack_dtype_code(DLDataTypeABI dt) {
+  require(dt.lanes == 1, "Vectorized DLPack dtypes (lanes != 1) are not supported.");
+  switch (dt.code) {
+    case 0:  // kDLInt
+      if (dt.bits == 8) return kIngestI8;
+      if (dt.bits == 16) return kIngestI16;
+      if (dt.bits == 32) return kIngestI32;
+      if (dt.bits == 64) return kIngestI64;
+      break;
+    case 1:  // kDLUInt
+      if (dt.bits == 8) return kIngestU8;
+      if (dt.bits == 16) return kIngestU16;
+      if (dt.bits == 32) return kIngestU32;
+      if (dt.bits == 64) return kIngestU64;
+      break;
+    case 2:  // kDLFloat
+      if (dt.bits == 16) return kIngestF16;
+      if (dt.bits == 32) return kIngestF32;
+      if (dt.bits == 64) return kIngestF64;
+      break;
+    case 4:  // kDLBfloat
+      if (dt.bits == 16) return kIngestBF16;
+      break;
+    case 6:  // kDLBool
+      if (dt.bits == 8) return kIngestBool;
+      if (dt.bits == 1) return kIngestBoolBits;
+      break;
+  }
+  throw std::invalid_argument("Unsupported DLPack dtype.");
+}
+
+struct ArrowSchemaABI {
+  char const* format;
+  char const* name;
+  char const* metadata;
+  std::int64_t flags;
+  std::int64_t n_children;
+  ArrowSchemaABI** children;
+  ArrowSchemaABI* dictionary;
+  void (*release)(ArrowSchemaABI*);
+  void* private_data;
+};
+struct ArrowArrayABI {
+  std::int64_t length;
+  std::int64_t null_count;
+  std::int64_t offset;
+  std::int64_t n_buffers;
+  std::int64_t n_children;
+  void const** buffers;
+  ArrowArrayABI** children;
+  ArrowArrayABI* dictionary;
+  void (*release)(ArrowArrayABI*);
+  void* private_data;
+};
+
+IngestColumnSpec arrow_column_to_spec(ArrowSchemaABI const* cs, ArrowArrayABI const* ca,
+                                      std::int64_t parent_offset, u32 expected_rows,
+                                      std::string& out_ftype) {
+  require(cs && ca && cs->format, "Invalid null Arrow column schema or array.");
+  require(!cs->dictionary && !ca->dictionary,
+          "Dictionary-encoded Arrow columns must use XGDMatrixCreateFromColumnar.");
+  require(ca->length >= 0 && static_cast<std::uint64_t>(ca->length) == expected_rows,
+          "All Arrow columns must have the same row count.");
+  std::string_view fmt(cs->format);
+  u32 code = 0;
+  if (fmt == "c") { code = kIngestI8; out_ftype = "int"; }
+  else if (fmt == "C") { code = kIngestU8; out_ftype = "int"; }
+  else if (fmt == "s") { code = kIngestI16; out_ftype = "int"; }
+  else if (fmt == "S") { code = kIngestU16; out_ftype = "int"; }
+  else if (fmt == "i") { code = kIngestI32; out_ftype = "int"; }
+  else if (fmt == "I") { code = kIngestU32; out_ftype = "int"; }
+  else if (fmt == "l") { code = kIngestI64; out_ftype = "int"; }
+  else if (fmt == "L") { code = kIngestU64; out_ftype = "int"; }
+  else if (fmt == "e") { code = kIngestF16; out_ftype = "float"; }
+  else if (fmt == "f") { code = kIngestF32; out_ftype = "float"; }
+  else if (fmt == "g") { code = kIngestF64; out_ftype = "float"; }
+  else if (fmt == "b") { code = kIngestBoolBits; out_ftype = "i"; }
+  else throw std::invalid_argument("Unsupported Arrow column format: " + std::string(fmt));
+
+  IngestColumnSpec spec;
+  spec.rows = expected_rows;
+  spec.cols = 1;
+  spec.dtype_code = code;
+  if (expected_rows == 0) return spec;
+
+  require(ca->n_buffers >= 2 && ca->buffers != nullptr, "Arrow primitive array requires at least 2 buffers.");
+  std::int64_t total_offset = parent_offset + ca->offset;
+  require(total_offset >= 0, "Invalid negative Arrow array offset.");
+
+  if (ca->buffers[0] != nullptr && ca->null_count != 0) {
+    spec.mask_mode = kIngestMaskValidBits;
+    spec.mask_ptr = reinterpret_cast<std::uintptr_t>(ca->buffers[0]);
+    spec.mask_bit_offset = total_offset;
+  }
+  require(ca->buffers[1] != nullptr, "Null Arrow data buffer for nonempty column.");
+  if (code == kIngestBoolBits) {
+    spec.data_ptr = reinterpret_cast<std::uintptr_t>(ca->buffers[1]);
+    spec.data_bit_offset = total_offset;
+  } else {
+    auto elem_bytes = descriptor_dtype_bytes(code);
+    spec.data_ptr = reinterpret_cast<std::uintptr_t>(
+        static_cast<std::uint8_t const*>(ca->buffers[1]) + static_cast<std::size_t>(total_offset) * elem_bytes);
+    spec.stride_r = static_cast<i64>(elem_bytes);
+    spec.stride_c = 0;
+  }
+  return spec;
+}
+}  // namespace
+
+int XGDMatrixCreateFromBufferDescriptor(XGBufferDescriptor const* desc, float missing, DMatrixHandle* out) {
+  return api([&] {
+    require(desc && out, "Null buffer descriptor or output handle.");
+    auto spec = spec_from_descriptor(*desc, true);
+    *out = new MatrixHandle(Matrix::from_ingest_2d(spec, missing));
+  });
+}
+
+int XGDMatrixCreateFromColumnarBuffers(XGBufferDescriptor const* columns, bst_ulong ncol, float missing, DMatrixHandle* out) {
+  return api([&] {
+    require(columns && out && ncol > 0, "Expected at least one feature column.");
+    require(ncol <= UINT32_MAX, "Columnar input exceeds dimension limits.");
+    std::vector<IngestColumnSpec> specs;
+    specs.reserve(static_cast<std::size_t>(ncol));
+    u32 nr = 0;
+    for (bst_ulong c = 0; c < ncol; ++c) {
+      auto spec = spec_from_descriptor(columns[c], false);
+      require(spec.cols == 1, "Each column buffer must contain one value per row.");
+      if (c == 0) nr = spec.rows;
+      else require(spec.rows == nr, "All feature columns must have the same length.");
+      specs.push_back(spec);
+    }
+    *out = new MatrixHandle(Matrix::from_ingest_columns(specs, nr, missing));
+  });
+}
+
+int XGDMatrixSetInfoFromBufferDescriptor(DMatrixHandle h, char const* field, XGBufferDescriptor const* desc) {
+  return api([&] {
+    require(field && desc, "Null metadata field or buffer descriptor.");
+    auto spec = spec_from_descriptor(*desc, false);
+    matrix(h)->set_info(field, Array(spec));
+  });
+}
+
+int XGDMatrixCreateFromDLPack(void* dl_managed_tensor, int is_versioned, float missing, DMatrixHandle* out) {
+  return api([&] {
+    require(dl_managed_tensor && out, "Null DLPack tensor or output handle.");
+    struct DeleterGuard {
+      void* ptr;
+      int versioned;
+      ~DeleterGuard() {
+        if (!ptr) return;
+        if (versioned) {
+          auto* v = static_cast<DLManagedTensorVersionedABI*>(ptr);
+          if (v->deleter) v->deleter(v);
+        } else {
+          auto* u = static_cast<DLManagedTensorABI*>(ptr);
+          if (u->deleter) u->deleter(u);
+        }
+      }
+    } guard{dl_managed_tensor, is_versioned};
+
+    DLTensorABI const& t = is_versioned
+        ? static_cast<DLManagedTensorVersionedABI const*>(dl_managed_tensor)->dl_tensor
+        : static_cast<DLManagedTensorABI const*>(dl_managed_tensor)->dl_tensor;
+
+    // kDLCPU = 1, kDLCUDAHost = 3, kDLMetal = 8, kDLROCMHost = 13
+    require(t.device.device_type == 1 || t.device.device_type == 3 ||
+            t.device.device_type == 8 || t.device.device_type == 13,
+            "DLPack tensor must reside in CPU or Apple Metal unified memory.");
+    require(t.ndim == 2 && t.shape != nullptr, "Feature data must be two dimensional.");
+    require(t.shape[0] >= 0 && t.shape[1] >= 0 &&
+            static_cast<std::uint64_t>(t.shape[0]) <= UINT32_MAX &&
+            static_cast<std::uint64_t>(t.shape[1]) <= UINT32_MAX,
+            "DLPack tensor dimensions exceed the 32-bit range.");
+
+    IngestColumnSpec spec;
+    spec.rows = static_cast<u32>(t.shape[0]);
+    spec.cols = static_cast<u32>(t.shape[1]);
+    spec.dtype_code = dlpack_dtype_code(t.dtype);
+    spec.prefer_zero_copy = (t.device.device_type == 8);
+    if (checked_product(spec.rows, spec.cols) > 0) {
+      require(t.data != nullptr, "Null DLPack data pointer for nonempty tensor.");
+      auto const* base = static_cast<std::uint8_t const*>(t.data) + t.byte_offset;
+      spec.data_ptr = reinterpret_cast<std::uintptr_t>(base);
+      if (spec.dtype_code == kIngestBoolBits) {
+        require(spec.cols == 1 && t.strides == nullptr, "Bit-packed DLPack boolean tensors must be contiguous single-column.");
+      } else {
+        auto elem_bytes = static_cast<i64>(descriptor_dtype_bytes(spec.dtype_code));
+        if (t.strides != nullptr) {
+          spec.stride_r = t.strides[0] * elem_bytes;
+          spec.stride_c = t.strides[1] * elem_bytes;
+        } else {
+          spec.stride_c = elem_bytes;
+          spec.stride_r = static_cast<i64>(spec.cols) * elem_bytes;
+        }
+      }
+    }
+    *out = new MatrixHandle(Matrix::from_ingest_2d(spec, missing));
+  });
+}
+
+int XGDMatrixCreateFromArrow(void const* arrow_schema, void const* arrow_array, float missing, DMatrixHandle* out) {
+  return api([&] {
+    require(arrow_schema && arrow_array && out, "Null Arrow schema, array, or output handle.");
+    auto* sch = const_cast<ArrowSchemaABI*>(static_cast<ArrowSchemaABI const*>(arrow_schema));
+    auto* arr = const_cast<ArrowArrayABI*>(static_cast<ArrowArrayABI const*>(arrow_array));
+    struct ArrowGuard {
+      ArrowSchemaABI* s;
+      ArrowArrayABI* a;
+      ~ArrowGuard() {
+        if (a && a->release) a->release(a);
+        if (s && s->release) s->release(s);
+      }
+    } guard{sch, arr};
+
+    require(sch->format != nullptr, "Released or invalid Arrow schema.");
+    require(arr->length >= 0 && static_cast<std::uint64_t>(arr->length) <= UINT32_MAX,
+            "Arrow array length exceeds 32-bit row limit.");
+    u32 nrows = static_cast<u32>(arr->length);
+    std::string_view fmt(sch->format);
+    std::vector<IngestColumnSpec> specs;
+    std::vector<std::string> names, types;
+
+    if (fmt == "+s") {
+      require(sch->n_children > 0 && sch->n_children == arr->n_children &&
+              sch->children != nullptr && arr->children != nullptr,
+              "Arrow RecordBatch/Struct must have at least one column.");
+      require(static_cast<std::uint64_t>(sch->n_children) <= UINT32_MAX, "Arrow column count exceeds limit.");
+      specs.reserve(static_cast<std::size_t>(sch->n_children));
+      names.reserve(static_cast<std::size_t>(sch->n_children));
+      types.reserve(static_cast<std::size_t>(sch->n_children));
+      bool all_named = true;
+      for (std::int64_t c = 0; c < sch->n_children; ++c) {
+        std::string ftype;
+        specs.push_back(arrow_column_to_spec(sch->children[c], arr->children[c], arr->offset, nrows, ftype));
+        types.push_back(std::move(ftype));
+        if (sch->children[c]->name && *sch->children[c]->name) names.emplace_back(sch->children[c]->name);
+        else all_named = false;
+      }
+      if (!all_named) names.clear();
+    } else {
+      std::string ftype;
+      specs.push_back(arrow_column_to_spec(sch, arr, 0, nrows, ftype));
+      types.push_back(std::move(ftype));
+      if (sch->name && *sch->name) names.emplace_back(sch->name);
+    }
+
+    auto m = Matrix::from_ingest_columns(specs, nrows, missing);
+    if (names.size() == m->cols) m->feature_names = std::move(names);
+    if (types.size() == m->cols) {
+      m->feature_types = std::move(types);
+      m->update_feature_types();
+    }
+    *out = new MatrixHandle(std::move(m));
+  });
+}
+
+int XGBoosterPredictFromBufferDescriptor(BoosterHandle h, XGBufferDescriptor const* desc, char const* config,
+                                         DMatrixHandle proxy, bst_ulong const** shape, bst_ulong* ndim,
+                                         float const** values) {
+  return booster_api(h, [&](Learner& b) {
+    require(desc && shape && ndim && values, "Null buffer descriptor or prediction output pointer.");
+    require(!b.is_linear(), "Inplace predict is not supported by the current booster.");
+    auto c = parse_json(config);
+    auto spec = spec_from_descriptor(*desc, true);
+    auto m = Matrix::from_ingest_2d(spec, missing_value(c));
+    copy_proxy_metadata(*m, proxy);
+    predict_output(b, *m, c, shape, ndim, values);
+  });
+}
+
+int XGBoosterPredictToBuffer(BoosterHandle h, DMatrixHandle dmat, char const* config, float* out_buffer,
+                             bst_ulong out_capacity, bst_ulong const** out_shape, bst_ulong* out_dim) {
+  return booster_api(h, [&](Learner& b) {
+    require(out_shape && out_dim, "Null output shape pointers.");
+    auto output = b.predict(*matrix(dmat), parse_json(config));
+    auto elems = output.values.size() / sizeof(float);
+    result.shape.assign(output.shape.begin(), output.shape.end());
+    *out_shape = result.shape.data();
+    *out_dim = result.shape.size();
+    require(elems <= out_capacity, "Output buffer capacity (" + std::to_string(out_capacity) +
+            ") is smaller than prediction size (" + std::to_string(elems) + ").");
+    if (elems > 0) {
+      require(out_buffer != nullptr, "Null output buffer for nonempty prediction.");
+      std::memcpy(out_buffer, output.values.as<float>(), elems * sizeof(float));
+    }
+  });
+}
+
+int XGDMatrixBuildCVFolds(DMatrixHandle h, int nfold, unsigned seed, int shuffle, int stratified,
+                          DMatrixHandle* out_train, DMatrixHandle* out_test) {
+  return api([&] {
+    require(out_train && out_test, "Null CV fold output arrays.");
+    require(nfold >= 2, "nfold must be at least 2.");
+    auto const& m = *matrix(h);
+    std::mt19937 rng(seed);
+    std::vector<MatrixHandle> train_folds(nfold), test_folds(nfold);
+
+    if (!m.group_ptr.empty() && m.group_ptr.size() > 1) {
+      require(!stratified, "Stratified CV is not supported with query groups.");
+      std::size_t ngroups = m.group_ptr.size() - 1;
+      require(static_cast<std::size_t>(nfold) <= ngroups, "Number of folds cannot exceed number of groups.");
+      std::vector<std::size_t> g_idx(ngroups);
+      std::iota(g_idx.begin(), g_idx.end(), 0);
+      if (shuffle) std::shuffle(g_idx.begin(), g_idx.end(), rng);
+
+      std::vector<int> group_fold(ngroups, 0);
+      std::size_t pos = 0;
+      for (int k = 0; k < nfold; ++k) {
+        std::size_t chunk = ngroups / static_cast<std::size_t>(nfold) +
+                            (static_cast<std::size_t>(k) < (ngroups % static_cast<std::size_t>(nfold)) ? 1 : 0);
+        for (std::size_t j = 0; j < chunk; ++j) group_fold[g_idx[pos++]] = k;
+      }
+
+      auto const& raw_w = m.get_info("weight");
+      bool has_group_weights = !raw_w.empty() && raw_w.size() == ngroups;
+      for (int k = 0; k < nfold; ++k) {
+        std::vector<int> train_rows, test_rows;
+        std::vector<u32> train_gp{0}, test_gp{0};
+        std::vector<float> train_gw, test_gw;
+        for (std::size_t g = 0; g < ngroups; ++g) {
+          u32 beg = m.group_ptr[g], end = m.group_ptr[g + 1];
+          if (group_fold[g] == k) {
+            for (u32 r = beg; r < end; ++r) test_rows.push_back(static_cast<int>(r));
+            test_gp.push_back(static_cast<u32>(test_rows.size()));
+            if (has_group_weights) test_gw.push_back(raw_w[g]);
+          } else {
+            for (u32 r = beg; r < end; ++r) train_rows.push_back(static_cast<int>(r));
+            train_gp.push_back(static_cast<u32>(train_rows.size()));
+            if (has_group_weights) train_gw.push_back(raw_w[g]);
+          }
+        }
+        auto dtr = m.slice(train_rows, true);
+        auto dte = m.slice(test_rows, true);
+        dtr->group_ptr = std::move(train_gp);
+        dte->group_ptr = std::move(test_gp);
+        if (has_group_weights) {
+          dtr->info["weight"] = std::move(train_gw);
+          dte->info["weight"] = std::move(test_gw);
+        }
+        dtr->refresh_metadata();
+        dte->refresh_metadata();
+        train_folds[k] = std::move(dtr);
+        test_folds[k] = std::move(dte);
+      }
+    } else {
+      u32 nrows = m.rows;
+      require(static_cast<u32>(nfold) <= nrows, "Number of folds cannot exceed number of rows.");
+      std::vector<int> row_fold(nrows, 0);
+      if (stratified) {
+        auto const& y = m.get_info("label");
+        require(y.size() == nrows, "Stratified CV requires 1D labels matching the number of rows.");
+        std::vector<u32> order(nrows);
+        std::iota(order.begin(), order.end(), 0);
+        if (shuffle) std::shuffle(order.begin(), order.end(), rng);
+        std::stable_sort(order.begin(), order.end(), [&](u32 a, u32 b) { return y[a] < y[b]; });
+        for (u32 pos = 0; pos < nrows; ++pos) row_fold[order[pos]] = static_cast<int>(pos % static_cast<u32>(nfold));
+      } else {
+        std::vector<u32> order(nrows);
+        std::iota(order.begin(), order.end(), 0);
+        if (shuffle) std::shuffle(order.begin(), order.end(), rng);
+        u32 pos = 0;
+        for (int k = 0; k < nfold; ++k) {
+          u32 chunk = nrows / static_cast<u32>(nfold) +
+                      (static_cast<u32>(k) < (nrows % static_cast<u32>(nfold)) ? 1u : 0u);
+          for (u32 j = 0; j < chunk; ++j) row_fold[order[pos++]] = k;
+        }
+      }
+
+      for (int k = 0; k < nfold; ++k) {
+        std::vector<int> train_rows, test_rows;
+        train_rows.reserve(nrows);
+        test_rows.reserve(nrows / static_cast<u32>(nfold) + 1);
+        for (u32 r = 0; r < nrows; ++r) {
+          if (row_fold[r] == k) test_rows.push_back(static_cast<int>(r));
+          else train_rows.push_back(static_cast<int>(r));
+        }
+        train_folds[k] = m.slice(train_rows, false);
+        test_folds[k] = m.slice(test_rows, false);
+      }
+    }
+
+    for (int k = 0; k < nfold; ++k) {
+      out_train[k] = new MatrixHandle(std::move(train_folds[k]));
+      out_test[k] = new MatrixHandle(std::move(test_folds[k]));
+    }
+  });
+}
+
+int XGDMatrixWasZeroCopied(DMatrixHandle h, int* out) {
+  return api([&] {
+    require(out != nullptr, "Null output pointer.");
+    *out = matrix(h)->was_zero_copied ? 1 : 0;
   });
 }

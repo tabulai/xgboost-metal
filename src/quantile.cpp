@@ -23,9 +23,50 @@ void Matrix::make_quantile_cuts(MatrixParams const& p) {
   bool unit_weights = get_info("weight").empty();
   summary_group_size = summary_batch_count = 0;
   weighted_summary_stages = weighted_summary_batch_count = 0;
-  Buffer queue(checked_product(checked_product(p.stride, cols), sizeof(Pair)));
+  bool sparse_csc = is_sparse();
+  if (sparse_csc) ensure_csc();
+  Buffer queue(checked_product(sparse_csc ? static_cast<std::size_t>(sparse_->nnz) : checked_product(p.stride, cols), sizeof(Pair)));
   Buffer statistics(checked_product(cols, sizeof(SketchStats)));
-  {
+  if (sparse_csc) {
+    statistics.zero();
+    if (cols > 0 && sparse_->nnz > 0) {
+      Buffer tile_counts(checked_product(cols, sizeof(u32)));
+      Buffer col_tile_offsets(checked_product(static_cast<std::size_t>(cols) + 1, sizeof(u32)));
+      std::vector<Buffer> keepalive;
+      {
+        Command tcmd("CSC quantile tile offsets");
+        tcmd.dispatch("sketch_csc_tile_counts", {sparse_->csc_col_ptr, categorical, tile_counts}, cols,
+                      {div_up(cols, 256), 1, 1});
+        prefix_sum_u32(tcmd, tile_counts, col_tile_offsets, cols, keepalive);
+        quantize_seconds += tcmd.wait(); ++quantize_commands;
+      }
+      u32 total_tiles = col_tile_offsets.as<u32>()[cols];
+      if (total_tiles > 0) {
+        Buffer tile_map(checked_product(total_tiles, 2 * sizeof(u32)));
+        Buffer temp_values(checked_product(checked_product(total_tiles, 128), sizeof(Pair)));
+        Buffer compact(queue.size());
+        Buffer starts(checked_product(sparse_->nnz, sizeof(u32)));
+        Buffer blocks(checked_product(total_tiles, sizeof(SketchInputBlock)));
+        SketchCscParams input{rows, cols, sparse_->nnz, total_tiles, static_cast<u32>(unit_weights), 0, 0, 0};
+        Command prepare("CSC quantile input queues");
+        prepare.dispatch("sketch_csc_populate_tiles", {col_tile_offsets, tile_map}, cols,
+                         {div_up(cols, 256), 1, 1});
+        prepare.dispatch("sketch_csc_blocks",
+                         {sparse_->csc_col_ptr, sparse_->csc_row_idx, sparse_->csc_val,
+                          sketch_weights, tile_map, temp_values, blocks},
+                         input, {div_up(total_tiles, 8), 1, 1});
+        prepare.dispatch("sketch_csc_offsets", {col_tile_offsets, blocks, statistics}, input,
+                         {div_up(cols, 64), 1, 1}, {64, 1, 1});
+        prepare.dispatch("sketch_csc_compact",
+                         {sparse_->csc_col_ptr, tile_map, temp_values, blocks, compact, starts},
+                         input, {div_up(total_tiles, 8), 1, 1});
+        prepare.dispatch("sketch_csc_runs",
+                         {sparse_->csc_col_ptr, col_tile_offsets, tile_map, compact, starts, statistics, queue},
+                         input, {div_up(static_cast<std::size_t>(total_tiles) * 128, 256), 1, 1});
+        quantize_seconds += prepare.wait(); ++quantize_commands;
+      }
+    }
+  } else {
     auto tiles = div_up(rows, 128);
     Buffer compact(queue.size());
     Buffer starts(checked_product(checked_product(p.stride, cols), sizeof(u32)));
@@ -48,6 +89,7 @@ void Matrix::make_quantile_cuts(MatrixParams const& p) {
   std::size_t slots = 0, level_slots = 0, work_slots = 0;
   u32 max_stride = 0, max_batch_size = 0, cut_capacity = 0;
   u32 max_integer_batch_size = 0, max_integer_prune_batch_size = 0;
+  auto const* csc_offsets = sparse_csc ? sparse_->csc_col_ptr.as<u32>() : nullptr;
   for (u32 feature = 0; feature < cols; ++feature) {
     auto const& stat = statistics.as<SketchStats>()[feature];
     // Each retained summary has at most one entry per input run. This also
@@ -57,11 +99,13 @@ void Matrix::make_quantile_cuts(MatrixParams const& p) {
     u32 budget = sketch_budget(p.numeric_bins, stat.elements);
     u32 first = static_cast<u32>(batches.size());
     std::uint64_t capacity = std::uint64_t{2} * limit;
+    std::uint64_t col_base = sparse_csc ? static_cast<std::uint64_t>(csc_offsets[feature])
+                                        : std::uint64_t{feature} * p.stride;
     for (std::uint64_t begin = 0; begin < stat.runs; begin += capacity) {
       auto size = static_cast<u32>(std::min<std::uint64_t>(capacity, stat.runs - begin));
       auto stride = static_cast<u32>(div_up(size, 256) * 256);
       u32 exact_integer_weights = unit_weights && stat.elements <= (1u << 24);
-      batches.push_back({std::uint64_t{feature} * p.stride + begin, slots, size, stride, limit, exact_integer_weights});
+      batches.push_back({col_base + begin, slots, size, stride, limit, exact_integer_weights});
       slots += stride;
       max_stride = std::max(max_stride, stride);
       max_batch_size = std::max(max_batch_size, size);

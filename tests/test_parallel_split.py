@@ -73,7 +73,7 @@ def test_nonroot_scalar_rounding_boundaries(exponent):
 
 
 @pytest.mark.parametrize("case", ["cpu_driver", "serial", "subtraction_control", "original_gain", "fast_weight",
-                                  "depth_one", "large_bins", "tiled", "categorical", "sampling"])
+                                  "depth_one", "large_bins", "tiled", "categorical", "interaction"])
 def test_unsupported_paths_keep_32_thread_selection(case):
     X, y = inputs(density=0.8)
     params, metadata, bins = {"metal_fallback_parallel_splits": 0}, {}, 128
@@ -98,8 +98,14 @@ def test_unsupported_paths_keep_32_thread_selection(case):
         X[present, 0] = np.arange(np.count_nonzero(present)) % 5
         metadata["feature_types"] = ["c"] + ["q"] * 6
     else:
-        params["subsample"] = 0.7
+        params["interaction_constraints"] = "[[0, 1], [2, 3]]"
     compare(X, y, bins=bins, params=params, metadata=metadata, expected_threads=32, rounds=2)
+
+
+def test_sampled_rows_use_256_thread_gpu_driver_selection():
+    X, y = inputs(density=0.8)
+    compare(X, y, bins=128, params={"metal_fallback_parallel_splits": 0, "subsample": 0.7},
+            expected_threads=256, rounds=2)
 
 
 @pytest.mark.parametrize("fraction", [0.125, 0.75])

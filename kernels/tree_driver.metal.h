@@ -13,13 +13,14 @@ kernel void tree_driver_init(device TreeDriverState* state [[buffer(0)]],
                               device uint* counts [[buffer(3)]],
                               device uint* offsets [[buffer(4)]],
                               device uint* flags [[buffer(5)]],
-                              constant TreeDriverParams& p [[buffer(6)]],
+                              device const uint* sampled_count [[buffer(6)]],
+                              constant TreeDriverParams& p [[buffer(7)]],
                               uint tid [[thread_position_in_grid]]) {
   if (tid) return;
   state[0] = TreeDriverState{1, 1, 0, 0};
   ids[0] = 0;
   sums[0] = IntPair{0, 0};
-  counts[0] = p.partition.rows;
+  counts[0] = (p.control_flags & kTreeDriverSampledRows) ? sampled_count[0] : p.partition.rows;
   offsets[0] = 0;
   for (uint node = 0; node < p.node_capacity; ++node) flags[node] = 0;
 }

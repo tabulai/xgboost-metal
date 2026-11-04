@@ -9,6 +9,9 @@ from . import (
     tracker,  # noqa
 )
 from ._c_api import _py_version
+from ._metal_array import MetalArray
+from ._sparse import COOMatrix, CSCMatrix, CSRMatrix
+from .config import config_context, get_config, set_config
 from .core import (
     Booster,
     DataIter,
@@ -21,8 +24,11 @@ from .tracker import RabitTracker  # noqa
 from .training import cv, train
 
 try:
-    from .config import config_context, get_config, set_config
     from .plotting import plot_importance, plot_tree, to_graphviz
+except ImportError:
+    pass
+
+try:
     from .sklearn import (
         XGBClassifier,
         XGBModel,
@@ -43,6 +49,10 @@ __all__ = [
     "DMatrix",
     "QuantileDMatrix",
     "ExtMemQuantileDMatrix",
+    "MetalArray",
+    "CSRMatrix",
+    "CSCMatrix",
+    "COOMatrix",
     "Booster",
     "DataIter",
     "train",

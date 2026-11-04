@@ -70,7 +70,21 @@ from pyspark.sql.types import (
     LongType,
     ShortType,
 )
-from scipy.special import expit, softmax  # pylint: disable=no-name-in-module
+def expit(x: np.ndarray) -> np.ndarray:
+    """Numerically stable logistic sigmoid without SciPy."""
+    out = np.empty_like(x, dtype=np.float32)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
+
+
+def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable softmax without SciPy."""
+    shifted = x - np.max(x, axis=axis, keepdims=True)
+    ex = np.exp(shifted)
+    return ex / np.sum(ex, axis=axis, keepdims=True)
 
 from .._c_api import _py_version
 from .._typing import ArrayLike

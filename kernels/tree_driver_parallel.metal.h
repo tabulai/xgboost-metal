@@ -37,13 +37,14 @@ kernel void tree_driver_init_prepare_parallel(device TreeDriverState* state [[bu
     device TreeDriverDispatch* subtract_args [[buffer(17)]],
     device ulong* zero_bytes [[buffer(18)]],
     device TreeDriverDispatch* zero_args [[buffer(19)]],
-    constant TreeDriverParams& p [[buffer(20)]],
+    device const uint* sampled_count [[buffer(20)]],
+    constant TreeDriverParams& p [[buffer(21)]],
     uint tid [[thread_position_in_grid]]) {
   if (tid) return;
   TreeDriverState local_state{1, 1, 0, 0};
   ids[0] = 0;
   sums[0] = IntPair{0, 0};
-  counts[0] = p.partition.rows;
+  counts[0] = (p.control_flags & kTreeDriverSampledRows) ? sampled_count[0] : p.partition.rows;
   offsets[0] = 0;
   flags[0] = 0;
   tree_driver_fused_prepare(local_state, split, histogram, partition, parent_count, plan_histogram_args, histogram_args, plan_partition_args, partition_args, partition_scan_args, evaluate_args, select_args, subtract_args, zero_bytes, zero_args, p);
@@ -203,6 +204,7 @@ kernel void tree_driver_applied_statistics(device const TreeDriverState* state [
   auto sums = split_parent_sums(long2(split.left_sum.g, split.left_sum.h),
                                 long2(split.right_sum.g, split.right_sum.h), scales[p.split.group]);
   history[id].applied_parent_weight = split_parent_weight(sums, p.split.reg_alpha, p.split.reg_lambda,
-                                                          p.split.max_delta_step, bounds[0]);
+                                                          p.split.max_delta_step,
+                                                          bounds[(p.control_flags & kTreeDriverMonotone) ? id : 0]);
   history[id].applied_parent_hessian = cox_float_result(sums.y);
 }

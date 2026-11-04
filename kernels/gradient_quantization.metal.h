@@ -61,5 +61,7 @@ kernel void gradient_scales(device const uint* partial [[buffer(0)]],
     // at most rows/2, keeping every partial signed sum strictly below 2^63.
     reinterpret_cast<device float*>(scales)[block.y * 2 + block.x] =
         as_type<float>(uint(62 - exponent + 127) << 23);
+    if (block.x == 0)
+      reinterpret_cast<device GradCert*>(scales + p.groups)[block.y] = GradCert{0, 0, 0, 0, 0, 0, 0, 0};
   }
 }

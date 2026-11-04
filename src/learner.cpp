@@ -333,6 +333,7 @@ void Learner::initialize(Matrix const& data, bool custom) {
   base_margin = score_margins(base_score);
   initialized = true;
   forest_size_ = std::numeric_limits<std::size_t>::max();
+  shap_size_ = std::numeric_limits<std::size_t>::max();
 }
 
 void Learner::upload_model() {
@@ -420,8 +421,13 @@ Buffer Learner::encode_deferred_prediction(PredictionCache& cache, Command& comm
   if (!deferred.output)
     deferred.output = Buffer(checked_product(checked_product(deferred.params.rows, deferred.params.groups), sizeof(float)));
   auto const& b = deferred.inputs;
-  command.dispatch("predict", {b[0], b[1], b[2], b[3], b[4], deferred.output, b[5], b[6], b[7], b[8]},
-                   deferred.params, {div_up(deferred.params.rows, 256), deferred.params.groups, 1});
+  if (deferred.csr_col_idx)
+    command.dispatch("predict_csr", {b[0], deferred.csr_col_idx, deferred.csr_val, b[1], b[2], b[3], b[4],
+                                     deferred.output, b[5], b[6], b[7], b[8]},
+                     deferred.params, {div_up(deferred.params.rows, 256), deferred.params.groups, 1});
+  else
+    command.dispatch("predict", {b[0], b[1], b[2], b[3], b[4], deferred.output, b[5], b[6], b[7], b[8]},
+                     deferred.params, {div_up(deferred.params.rows, 256), deferred.params.groups, 1});
   return deferred.output;
 }
 void Learner::finish_deferred_prediction(PredictionCache& cache) {
@@ -485,6 +491,7 @@ Prediction Learner::predict(Matrix const& data, Json const& config) {
   Prediction result;
   if (type >= 2 && type <= 5) {
     auto input = data.data_for_categories(categories);
+    bool use_csr = data.is_sparse() && !input;
     Command command("predict");
     upload_shap();
     auto columns = static_cast<std::size_t>(data.cols) + 1;
@@ -492,15 +499,31 @@ Prediction Learner::predict(Matrix const& data, Json const& config) {
     auto elements = checked_product(checked_product(data.rows, groups), columns);
     if (interactions) elements = checked_product(elements, columns);
     result.values = Buffer(checked_product(elements, sizeof(float)));
-    if (type == 3 || type == 5)
-      command.dispatch("approximate_contributions",
-                       {input, forest_nodes_, forest_trees_, node_means_, base_buffer_, data.margins, result.values, forest_categories_, weights},
-                       p, {div_up(data.rows, 64), groups, 1}, {64, 1, 1});
-    else {
+    if (type == 3 || type == 5) {
+      if (use_csr)
+        command.dispatch("approximate_contributions_csr",
+                         {data.sparse_->csr_row_ptr, data.sparse_->csr_col_idx, data.sparse_->csr_val,
+                          forest_nodes_, forest_trees_, node_means_, base_buffer_, data.margins, result.values, forest_categories_, weights},
+                         p, {div_up(data.rows, 64), groups, 1}, {64, 1, 1});
+      else
+        command.dispatch("approximate_contributions",
+                         {input, forest_nodes_, forest_trees_, node_means_, base_buffer_, data.margins, result.values, forest_categories_, weights},
+                         p, {div_up(data.rows, 64), groups, 1}, {64, 1, 1});
+    } else {
       p.trees = shap_leaf_count_;
-      command.dispatch("shap_contributions",
-                       {input, shap_paths_, shap_leaves_, base_buffer_, data.margins, result.values, shap_categories_, weights},
-                       p, {div_up(data.rows, 64), groups, 1}, {64, 1, 1});
+      bool shap_fast_enabled = integer("metal_shap_fast", 1) != 0;
+      p.bin_partition = shap_fast_enabled ? 1u : 0u;
+      bool fast_sram = use_csr && type == 2 && data.cols <= 32 && shap_fast_enabled;
+      u32 shap_threads = fast_sram ? 32 : 64;
+      if (use_csr)
+        command.dispatch(fast_sram ? "shap_contributions_csr_fast" : "shap_contributions_csr",
+                         {data.sparse_->csr_row_ptr, data.sparse_->csr_col_idx, data.sparse_->csr_val,
+                          shap_paths_, shap_leaves_, base_buffer_, data.margins, result.values, shap_categories_, weights},
+                         p, {div_up(data.rows, shap_threads), groups, 1}, {shap_threads, 1, 1});
+      else
+        command.dispatch(fast_sram ? "shap_contributions_fast" : "shap_contributions",
+                         {input, shap_paths_, shap_leaves_, base_buffer_, data.margins, result.values, shap_categories_, weights},
+                         p, {div_up(data.rows, shap_threads), groups, 1}, {shap_threads, 1, 1});
     }
     result.shape = {data.rows};
     if (strict || groups > 1) result.shape.push_back(groups);
@@ -509,12 +532,18 @@ Prediction Learner::predict(Matrix const& data, Json const& config) {
     record("shap", command.wait());
   } else if (type == 6) {
     auto input = data.data_for_categories(categories);
+    bool use_csr = data.is_sparse() && !input;
     Command command("predict");
     std::vector<TreeMeta> selected;
     for (u32 t = 0; t < trees.size(); ++t) if (trees[t].round >= begin && trees[t].round < end) selected.push_back(forest_trees_.as<TreeMeta>()[t]);
     p.trees = selected.size(); Buffer tree_buffer = upload(selected);
     result.values = Buffer(static_cast<std::size_t>(data.rows) * p.trees * sizeof(float));
-    if (shared_prediction)
+    if (use_csr)
+      command.dispatch("predict_leaf_csr",
+                       {data.sparse_->csr_row_ptr, data.sparse_->csr_col_idx, data.sparse_->csr_val,
+                        forest_nodes_, tree_buffer, result.values, forest_categories_},
+                       p, {div_up(data.rows, 256), p.trees, 1});
+    else if (shared_prediction)
       command.dispatch("predict_leaf_cached", {input, forest_nodes_, tree_buffer, result.values, forest_categories_},
                        p, {div_up(data.rows, prediction_threads), 1, 1}, {prediction_threads, 1, 1}, cache_bytes);
     else command.dispatch("predict_leaf", {input, forest_nodes_, tree_buffer, result.values, forest_categories_},
@@ -532,27 +561,47 @@ Prediction Learner::predict(Matrix const& data, Json const& config) {
       p.begin = cached.rounds; p.has_margin = 1; input_margins = cached.margins;
     }
     bool complete = reuse && cached.rounds == end;
-    bool transform = type == 0 && needs_prediction_transform(p.objective, groups, config.value("eval", false));
+    bool proba = type == 0 && config.value("metal_proba", false);
+    bool binary_proba = proba && groups == 1;
+    bool logitraw_multilabel_proba = proba && p.objective == 2 && groups > 1;
+    bool transform = type == 0 &&
+                     (needs_prediction_transform(p.objective, groups, config.value("eval", false)) || logitraw_multilabel_proba) &&
+                     !binary_proba;
     result.values = complete ? cached.margins : Buffer(static_cast<std::size_t>(data.rows) * groups * sizeof(float));
     auto raw_prediction = result.values;
-    bool classes = type == 0 && p.objective == 4 && !config.value("eval", false);
+    bool classes = type == 0 && p.objective == 4 && !config.value("eval", false) && !proba;
     // A complete raw-margin or identity-transform result is already resident.
     // Keep it without submitting an empty command or copying it on the GPU.
-    if (!complete || transform) {
+    if (!complete || transform || binary_proba) {
       Command command("predict");
       if (!complete) {
         auto input = data.data_for_categories(categories);
-        command.dispatch(shared_prediction ? "predict_cached" : "predict",
-                         {input, forest_nodes_, forest_trees_, base_buffer_, input_margins, result.values, forest_categories_, weights, forest_leaf_weights_, base_buffer_}, p,
-                         {div_up(data.rows, shared_prediction ? prediction_threads : 256), groups, 1},
-                         {shared_prediction ? prediction_threads : 256, 1, 1}, shared_prediction ? cache_bytes : 0);
+        bool tree_cached = !shared_prediction && integer("metal_predict_tree_cached", 1) &&
+                           data.rows >= 512 && (end - p.begin) >= 2;
+        if (data.is_sparse() && !input) {
+          command.dispatch(tree_cached ? "predict_csr_tree_cached" : "predict_csr",
+                           {data.sparse_->csr_row_ptr, data.sparse_->csr_col_idx, data.sparse_->csr_val,
+                            forest_nodes_, forest_trees_, base_buffer_, input_margins, result.values,
+                            forest_categories_, weights, forest_leaf_weights_, base_buffer_},
+                           p, {div_up(data.rows, 256), groups, 1});
+        } else {
+          command.dispatch(shared_prediction ? "predict_cached" : (tree_cached ? "predict_tree_cached" : "predict"),
+                           {input, forest_nodes_, forest_trees_, base_buffer_, input_margins, result.values, forest_categories_, weights, forest_leaf_weights_, base_buffer_}, p,
+                           {div_up(data.rows, shared_prediction ? prediction_threads : 256), groups, 1},
+                           {shared_prediction ? prediction_threads : 256, 1, 1}, shared_prediction ? cache_bytes : 0);
+        }
       }
-      if (transform) {
+      if (binary_proba) {
+        result.values = Buffer(checked_product(data.rows, 2 * sizeof(float)));
+        if (data.rows) command.dispatch("expand_binary_proba", {raw_prediction, result.values}, p, {div_up(data.rows, 256), 1, 1});
+      } else if (transform) {
+        PredictParams p_tx = p;
+        if (logitraw_multilabel_proba) p_tx.objective = 1;
         if (preserve) {
           // Objective transforms must not overwrite the reusable raw margins.
           result.values = Buffer(static_cast<std::size_t>(data.rows) * groups * sizeof(float));
-          command.dispatch("transform_copy", {raw_prediction, result.values}, p, {div_up(data.rows, 256), 1, 1});
-        } else command.dispatch("transform", {result.values}, p, {div_up(data.rows, 256), 1, 1});
+          command.dispatch("transform_copy", {raw_prediction, result.values}, p_tx, {div_up(data.rows, 256), 1, 1});
+        } else command.dispatch("transform", {result.values}, p_tx, {div_up(data.rows, 256), 1, 1});
       }
       if (classes) {
         Buffer output(data.rows * sizeof(float));
@@ -563,13 +612,16 @@ Prediction Learner::predict(Matrix const& data, Json const& config) {
     }
     if (preserve) { cached.margins = raw_prediction; cached.rounds = end; }
     else { cached.margins = {}; cached.rounds = 0; }
-    if (classes) {
+    if (binary_proba) {
+      result.shape = {data.rows, 2};
+    } else if (classes) {
       result.shape = strict ? std::vector<std::uint64_t>{data.rows, 1} : std::vector<std::uint64_t>{data.rows};
-    } else result.shape = (strict || groups > 1) ? std::vector<std::uint64_t>{data.rows, groups} : std::vector<std::uint64_t>{data.rows};
+    } else result.shape = (strict || groups > 1 || proba) ? std::vector<std::uint64_t>{data.rows, groups} : std::vector<std::uint64_t>{data.rows};
   }
   if (type < 2 || type == 6) {
     if (!data.rows) {
       if (type == 6 && strict) result.shape = {0, end - begin, groups, 1};
+      else if (type == 0 && config.value("metal_proba", false)) result.shape = {0, groups == 1 ? 2u : groups};
       else result.shape = {0, 0};
     }
     active_tuning["prediction_shared"] = shared_prediction;
@@ -631,7 +683,7 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
                             integer("metal_gradient_root_fusion", 1);
   // Ordinary DMatrix feature storage is immutable. QuantileDMatrix can decode
   // changed feature types into the same storage, so retain its eager boundary.
-  bool defer_prediction = fuse_gradient_root && !data.is_quantile && groups == 1 &&
+  bool defer_prediction = fuse_gradient_root && !data.is_quantile && !vector &&
                           integer("num_parallel_tree", 1) == 1 && objective() <= 10 &&
                           !weighted && data.get_info("base_margin").empty() &&
                           tree_updaters_.size() == 1 && integer("metal_defer_prediction", 1);
@@ -640,7 +692,8 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   // Asynchronous rounds extend deferred updates: the next margin update reads
   // a GPU-emitted Node table, so an eligible GPU-driven round returns before
   // its command completes. Other updates first retire committed rounds.
-  bool async = defer_prediction && async_depth;
+  bool async = defer_prediction && async_depth && groups == 1 &&
+               number("colsample_bylevel", 1) == 1 && number("colsample_bynode", 1) == 1;
   if (!async) drain();
   // Retirement during this call must not report an older tree's depth.
   async_tuning_round_ = UINT32_MAX;
@@ -729,7 +782,8 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
       Buffer partial = scratch(values ? round_buffers_.value_partial : round_buffers_.partial,
                                checked_product(checked_product(div_up(data.rows, kGradientRowsPerTile), columns),
                                                kGradientPartialWords * sizeof(u32)));
-      scale = scratch(values ? round_buffers_.value_scale : round_buffers_.scale, checked_product(columns, sizeof(Pair)));
+      scale = scratch(values ? round_buffers_.value_scale : round_buffers_.scale,
+                      checked_product(columns, sizeof(Pair) + sizeof(GradCert)));
       output = scratch(values ? round_buffers_.value_quantized : round_buffers_.quantized,
                        checked_product(checked_product(data.rows, columns), 2 * sizeof(std::int64_t)));
       auto qp = p; qp.groups = columns;
@@ -751,8 +805,34 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   auto parallel = integer("num_parallel_tree", 1);
   auto eta = number("learning_rate", 0.3f) / parallel;
   auto tree_groups = vector ? 1u : groups;
+  auto total_trees = static_cast<std::size_t>(tree_groups) * parallel;
+  bool batch_trees = total_trees > 1 && !sampling && !is_tree_update() &&
+                     !(value_gradient && vector) && tree_updaters_.size() == 1 && !async &&
+                     number("colsample_bylevel", 1) == 1 && number("colsample_bynode", 1) == 1 &&
+                     integer("metal_batch_trees", 1) != 0;
+  std::optional<Command> batch_owned;
+  if (batch_trees && !fuse_gradient_root)
+    batch_owned.emplace("GPU tree batch", integer("metal_coalesce_encoders", 0), integer("metal_compute_fill", 0));
+  Command* batch_cmd = batch_trees ? (fuse_gradient_root ? &command : &*batch_owned) : nullptr;
+  std::vector<GpuTreeRound> batch_rounds(batch_trees ? total_trees : 0);
   GpuTreeRound async_tree;
-  for (u32 group = 0; group < tree_groups; ++group) for (u32 t = 0; t < parallel; ++t) {
+  std::size_t k = 0;
+  for (u32 group = 0; group < tree_groups; ++group) for (u32 t = 0; t < parallel; ++t, ++k) {
+    if (batch_trees) {
+      batch_rounds[k].emit_nodes = false;
+      batch_rounds[k].batch_index = static_cast<u32>(k);
+      batch_rounds[k].root_is_batch_only = !fuse_gradient_root;
+      if (k > 0 && commit_early) batch_cmd->flush();
+      auto tree = grow(data, quantized, scales, group, eta, false,
+                       vector ? gradient_groups : 1, vector ? groups : 1,
+                       batch_cmd, &batch_rounds[k]);
+      if (batch_rounds[k]) continue;
+      batch_trees = false;
+      pending.publish();
+      tree.group = group; tree.round = rounds;
+      trees.push_back(std::move(tree));
+      continue;
+    }
     SampledGradients sampled;
     if (sampling) sampled = sample_gradients(gradient, data.rows, group, static_cast<u32>(budget), t == 0,
                                              vector ? gradient_groups : 1, gradient_groups);
@@ -784,6 +864,24 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
         modify_tree(tree, data, sampled_refresh ? sampled.values : gradient, eta, updater, sampled_refresh);
     trees.push_back(std::move(tree));
   }
+  if (batch_trees) {
+    record(fuse_gradient_root ? "gradient_tree" : "gpu_tree", batch_cmd->wait());
+    pending.publish();
+    for (std::size_t idx = 0; idx < total_trees; ++idx) {
+      auto const& round = batch_rounds[idx];
+      if (round.unit_mismatch) active_tuning["histogram_unit_hessian"] = !round.unit_mismatch.as<u32>()[0];
+      if (round.screen_counters) {
+        auto const* values = round.screen_counters.as<u32>();
+        split_screening.candidates += values[0]; split_screening.certified += values[1];
+        split_screening.uncertain += values[2]; split_screening.exact += values[3];
+        split_screening.groups += values[4]; split_screening.exact_groups += values[5];
+      }
+      u32 evaluated_levels = 0;
+      auto tree = replay_gpu_tree(round, evaluated_levels);
+      active_tuning["gpu_tree_levels"] = evaluated_levels;
+      trees.push_back(std::move(tree));
+    }
+  }
   auto margin_bytes = static_cast<std::size_t>(data.rows) * groups * sizeof(float);
   if (async_tree) {
     auto next_prediction = round_buffers ? pooled_buffer(margin_pool_, margin_bytes) : Buffer(margin_bytes);
@@ -795,19 +893,22 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
     active_tuning["prediction_cache_deferred"] = 1;
     active_tuning["prediction_cache_consumed"] = consumed_prediction;
     active_tuning["async_rounds"] = async_depth;
+    active_tuning["batch_trees"] = 0;
     active_tuning["round_buffers"] = round_buffers;
     active_tuning["commit_early"] = commit_early;
     // Same tree range and floating-point additions as the forest recipe
     // below, reading the emitted single-tree table instead. Unused inputs
     // (base scores, categories, tree and leaf weights) bind a valid buffer.
     PredictParams pp{data.rows, data.cols, groups, 1, rounds - 1, rounds, objective(), 1, 1, groups, 0, 0};
-    auto input = data.partition_data();
+    auto input = data.is_sparse() ? data.sparse_->csr_row_ptr : data.partition_data();
     auto bounds = data.partition_category_bounds();
     pp.bin_partition = static_cast<u32>(static_cast<bool>(bounds));
     auto const& unused = async_tree.meta;
     prediction_cache(data).deferred = DeferredPrediction{{input, async_tree.nodes, async_tree.meta, unused, prediction,
                                                           unused, unused, unused, bounds ? bounds : unused},
-                                                         next_prediction, pp, rounds};
+                                                         next_prediction, pp, rounds,
+                                                         data.is_sparse() ? data.sparse_->csr_col_idx : Buffer{},
+                                                         data.is_sparse() ? data.partition_data() : Buffer{}};
     async_tuning_round_ = async_tree.round;
     // Retire completed rounds in order, then bound the rounds in flight.
     while (!inflight_.empty() && (inflight_.size() > async_depth || inflight_.front().command->completed()))
@@ -825,6 +926,7 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
   active_tuning["prediction_cache_deferred"] = 0;
   active_tuning["prediction_cache_consumed"] = consumed_prediction;
   active_tuning["async_rounds"] = 0;
+  active_tuning["batch_trees"] = batch_trees;
   active_tuning["round_buffers"] = round_buffers;
   active_tuning["commit_early"] = commit_early;
   upload_model();
@@ -832,23 +934,44 @@ void Learner::update(Matrix& data, int iteration, Array const* custom_gradient, 
     Buffer next_prediction = round_buffers ? pooled_buffer(margin_pool_, margin_bytes) : Buffer(margin_bytes);
     PredictParams pp{data.rows, data.cols, groups, static_cast<u32>(trees.size()), rounds - 1, rounds, objective(), 1, 1, groups, 0, 0};
     pp.tree_begin = static_cast<u32>(first_new_tree);
-    auto input = is_tree_update() || has_refresh() ? data.data : data.partition_data();
-    auto bounds = is_tree_update() || has_refresh() ? Buffer{} : data.partition_category_bounds();
+    bool unpartitioned = is_tree_update() || has_refresh();
+    auto bounds = unpartitioned ? Buffer{} : data.partition_category_bounds();
     pp.bin_partition = static_cast<u32>(static_cast<bool>(bounds));
     auto& cached = prediction_cache(data);
     // Prediction with a base margin resets the prefix version before growing.
     auto version = data.get_info("base_margin").empty() ? rounds : 1;
-    if (defer_prediction && active_tuning["gpu_tree"]) {
-      cached.deferred = DeferredPrediction{{input, forest_nodes_, forest_trees_, base_buffer_, prediction,
-                                           forest_categories_, forest_weights_, forest_leaf_weights_,
-                                           bounds ? bounds : base_buffer_}, next_prediction, pp, version};
-      active_tuning["prediction_cache_deferred"] = 1;
+    if (data.is_sparse()) {
+      auto csr_vals = unpartitioned ? data.sparse_->csr_val : data.partition_data();
+      if (defer_prediction && active_tuning["gpu_tree"]) {
+        cached.deferred = DeferredPrediction{{data.sparse_->csr_row_ptr, forest_nodes_, forest_trees_, base_buffer_, prediction,
+                                              forest_categories_, forest_weights_, forest_leaf_weights_,
+                                              bounds ? bounds : base_buffer_}, next_prediction, pp, version,
+                                             data.sparse_->csr_col_idx, csr_vals};
+        active_tuning["prediction_cache_deferred"] = 1;
+      } else {
+        Command cache("update training predictions");
+        cache.dispatch("predict_csr", {data.sparse_->csr_row_ptr, data.sparse_->csr_col_idx, csr_vals,
+                                       forest_nodes_, forest_trees_, base_buffer_, prediction, next_prediction,
+                                       forest_categories_, forest_weights_, forest_leaf_weights_, bounds ? bounds : base_buffer_},
+                       pp, {div_up(data.rows, 256), groups, 1});
+        record("prediction_cache", cache.wait());
+        cached.margins = next_prediction;
+        cached.rounds = version;
+      }
     } else {
-      Command cache("update training predictions");
-      cache.dispatch("predict", {input, forest_nodes_, forest_trees_, base_buffer_, prediction, next_prediction, forest_categories_, forest_weights_, forest_leaf_weights_, bounds ? bounds : base_buffer_}, pp, {div_up(data.rows, 256), groups, 1});
-      record("prediction_cache", cache.wait());
-      cached.margins = next_prediction;
-      cached.rounds = version;
+      auto input = unpartitioned ? data.data : data.partition_data();
+      if (defer_prediction && active_tuning["gpu_tree"]) {
+        cached.deferred = DeferredPrediction{{input, forest_nodes_, forest_trees_, base_buffer_, prediction,
+                                              forest_categories_, forest_weights_, forest_leaf_weights_,
+                                              bounds ? bounds : base_buffer_}, next_prediction, pp, version};
+        active_tuning["prediction_cache_deferred"] = 1;
+      } else {
+        Command cache("update training predictions");
+        cache.dispatch("predict", {input, forest_nodes_, forest_trees_, base_buffer_, prediction, next_prediction, forest_categories_, forest_weights_, forest_leaf_weights_, bounds ? bounds : base_buffer_}, pp, {div_up(data.rows, 256), groups, 1});
+        record("prediction_cache", cache.wait());
+        cached.margins = next_prediction;
+        cached.rounds = version;
+      }
     }
   }
   if (objective() >= 17) {
@@ -884,6 +1007,7 @@ void Learner::reset(bool clear_dropout) {
   forest_nodes_ = {}; forest_trees_ = {}; forest_categories_ = {}; forest_weights_ = {}; forest_leaf_weights_ = {}; forest_size_ = std::numeric_limits<std::size_t>::max();
   forest_node_count_ = 0; forest_category_count_ = 0; forest_leaf_count_ = 0;
   shap_paths_ = {}; shap_leaves_ = {}; shap_categories_ = {}; node_means_ = {}; shap_size_ = std::numeric_limits<std::size_t>::max();
+  shap_path_count_ = 0; shap_category_count_ = 0; shap_mean_count_ = 0; shap_leaf_count_ = 0;
 }
 std::string Learner::default_metric() const {
   auto obj = objective();

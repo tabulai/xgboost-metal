@@ -111,6 +111,7 @@ def test_unsupported_paths_retain_original_allocations_and_clear(case):
         metadata["feature_types"] = ["c"] + ["q"] * 6
     elif case == "sampling":
         params["subsample"] = 0.7
+        expected = dict.fromkeys(FLAGS, 1)
     elif case == "serial":
         params["metal_parallel_splits"] = 0
         expected["histogram_compact_scratch"] = 1

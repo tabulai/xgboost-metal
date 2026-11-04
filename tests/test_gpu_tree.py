@@ -145,18 +145,33 @@ def test_encoder_fill_and_split_modes(coalesce, fill, parallel_splits):
     assert_path(stats, 1)
 
 
+GPU_EXTENDED = [
+    ("monotone", "regression", {"monotone_constraints": "(1,0,-1,0,0,0,0)"}),
+    ("level_sampling", "regression", {"colsample_bylevel": 0.8}),
+    ("node_sampling", "regression", {"colsample_bynode": 0.8}),
+    ("level_and_node_sampling", "regression", {"colsample_bytree": 0.8, "colsample_bylevel": 0.75, "colsample_bynode": 0.75}),
+    ("uniform_sampling", "regression", {"subsample": 0.7}),
+    ("gradient_sampling", "regression", {"subsample": 0.7, "sampling_method": "gradient_based"}),
+]
+
+
+@pytest.mark.parametrize("_name,case,params", GPU_EXTENDED, ids=[row[0] for row in GPU_EXTENDED])
+def test_extended_configurations_run_on_gpu_driver(_name, case, params):
+    expected, control_stats = train(0, case, params, rounds=3)
+    actual, stats = train(1, case, params, rounds=3)
+    assert_identical(expected, actual)
+    assert_path(control_stats, 0)
+    assert_path(stats, 1)
+    assert stats[-1]["command_buffers"] < control_stats[-1]["command_buffers"]
+
+
 FALLBACKS = [
     ("shallow", "regression", {"max_depth": 1}),
     ("deep", "regression", {"max_depth": 11}),
     ("unlimited", "regression", {"max_depth": 0, "max_leaves": 9}),
     ("lossguide", "regression", {"grow_policy": "lossguide"}),
     ("max_leaves", "regression", {"max_leaves": 7}),
-    ("monotone", "regression", {"monotone_constraints": "(1,0,-1,0,0,0,0)"}),
     ("interaction", "regression", {"interaction_constraints": "[[0,1,2],[3,4,5,6]]"}),
-    ("level_sampling", "regression", {"colsample_bylevel": 0.8}),
-    ("node_sampling", "regression", {"colsample_bynode": 0.8}),
-    ("uniform_sampling", "regression", {"subsample": 0.7}),
-    ("gradient_sampling", "regression", {"subsample": 0.7, "sampling_method": "gradient_based"}),
     ("cache_eviction", "regression", {"max_cached_hist_node": 1}),
     ("atomic_partition", "regression", {"metal_partition_scan": 0}),
     ("separate_partition", "regression", {"metal_fused_partition": 0}),

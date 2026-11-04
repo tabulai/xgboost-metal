@@ -137,9 +137,11 @@ def test_encoder_gradient_and_control_variants(coalesce, gradient_fusion, contro
                     "metal_tree_control_fusion": control_fusion})
 
 
-@pytest.mark.parametrize("case", ["custom", "multiclass", "parallel", "bytree"])
+@pytest.mark.parametrize("case", ["custom", "multiclass", "parallel", "bytree", "subsample"])
 def test_gradient_groups_and_sampling(case):
-    X, y, metadata, params = inputs(case, rows=1029)
+    X, y, metadata, params = inputs("regression" if case == "subsample" else case, rows=1029)
+    if case == "subsample":
+        params["subsample"] = 0.7
     custom = None
     if case == "custom":
         custom = lambda prediction, matrix: ((prediction - matrix.get_label()).astype(np.float32),
@@ -155,7 +157,7 @@ def test_quantile_matrices(quantile):
 
 
 @pytest.mark.parametrize("params", [{"metal_gpu_tree": 0}, {"max_depth": 1}, {"max_depth": 11},
-                                    {"grow_policy": "lossguide"}, {"subsample": 0.7}])
+                                    {"grow_policy": "lossguide"}])
 def test_original_driver_keeps_the_stable_partition(params):
     X, y, metadata, _ = inputs("missing")
     compare(X, y, metadata=metadata, params=params, expected_active=0)

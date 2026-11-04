@@ -1,8 +1,11 @@
 """Helpers for interfacing array like objects."""
 
+from __future__ import annotations
+
 import copy
 import ctypes
 import json
+import math
 import warnings
 from abc import ABC, abstractmethod
 from functools import cache as fcache
@@ -25,9 +28,9 @@ from typing import (
     overload,
 )
 
-import numpy as np
-
+from ._metal_array import MetalArray, resolve_dtype
 from ._typing import (
+    HAS_NUMPY,
     ArrowCatList,
     CNumericPtr,
     DataType,
@@ -37,7 +40,13 @@ from ._typing import (
 )
 from .compat import import_cudf, import_cupy, import_pyarrow, lazy_isinstance
 
+if HAS_NUMPY:
+    import numpy as np
+else:
+    np = None  # type: ignore[assignment]
+
 if TYPE_CHECKING:
+    import numpy as np
     import pandas as pd
     import pyarrow as pa
 
@@ -161,9 +170,9 @@ def from_array_interface(interface: ArrayInf, zero_copy: bool = False) -> NumpyO
             return aif["shape"]
 
         @property
-        def size(self) -> np.signedinteger:
+        def size(self) -> int:
             """Total size of the input array."""
-            return np.prod(self.shape)
+            return int(math.prod(self.shape))
 
     arr = Array()
 
@@ -174,13 +183,20 @@ def from_array_interface(interface: ArrayInf, zero_copy: bool = False) -> NumpyO
         arr.__cuda_array_interface__ = interface
         cp = import_cupy()
         if arr.size == 0:
-            return cp.empty(shape=arr.shape, dtype=np.dtype(interface["typestr"]))
+            return cp.empty(shape=arr.shape, dtype=interface["typestr"])
         out = cp.array(arr, copy=not zero_copy)
-    else:
+    elif HAS_NUMPY and np is not None:
         arr.__array_interface__ = interface
         if arr.size == 0:
             return np.empty(shape=arr.shape, dtype=np.dtype(interface["typestr"]))
         out = np.array(arr, copy=not zero_copy)
+    else:
+        shape = tuple(int(d) for d in interface["shape"])
+        typestr = interface["typestr"]
+        ptr_addr = interface["data"][0]
+        if math.prod(shape) == 0 or not ptr_addr:
+            return MetalArray.empty(shape, dtype=typestr)
+        out = MetalArray.from_pointer(int(ptr_addr), shape, dtype=typestr)
 
     return out
 
@@ -194,7 +210,7 @@ STREAM_PER_THREAD = 2
 def make_array_interface(
     ptr: Union[CNumericPtr, int],
     shape: Tuple[int, ...],
-    dtype: Type[np.number],
+    dtype: Any,
     is_cuda: bool,
 ) -> ArrayInf:
     """Make an __(cuda)_array_interface__ from a pointer."""
@@ -202,15 +218,25 @@ def make_array_interface(
     if is_cuda:
         empty = import_cupy().empty(shape=(0,), dtype=dtype)
         array = empty.__cuda_array_interface__  # pylint: disable=no-member
-    else:
+    elif HAS_NUMPY and np is not None:
         empty = np.empty(shape=(0,), dtype=dtype)
         array = empty.__array_interface__  # pylint: disable=no-member
+    else:
+        spec = resolve_dtype(dtype)
+        array = {
+            "data": (0, True),
+            "typestr": spec.typestr,
+            "version": 3,
+            "strides": None,
+            "shape": (0,),
+            "mask": None,
+        }
 
     if not isinstance(ptr, int):
         addr = ctypes.cast(ptr, ctypes.c_void_p).value
     else:
         addr = ptr
-    length = int(np.prod(shape))
+    length = int(math.prod(shape))
     # Handle empty dataset.
     assert addr is not None or length == 0
 
@@ -263,21 +289,21 @@ def _is_df_cat(data: Any) -> TypeGuard[DfCatAccessor]:
 
 
 @fcache
-def _arrow_npdtype() -> Dict[Any, Type[np.number]]:
+def _arrow_npdtype() -> Dict[Any, Any]:
     import pyarrow as pa
 
-    mapping: Dict[Any, Type[np.number]] = {
-        pa.int8(): np.int8,
-        pa.int16(): np.int16,
-        pa.int32(): np.int32,
-        pa.int64(): np.int64,
-        pa.uint8(): np.uint8,
-        pa.uint16(): np.uint16,
-        pa.uint32(): np.uint32,
-        pa.uint64(): np.uint64,
-        pa.float16(): np.float16,
-        pa.float32(): np.float32,
-        pa.float64(): np.float64,
+    mapping: Dict[Any, Any] = {
+        pa.int8(): "int8",
+        pa.int16(): "int16",
+        pa.int32(): "int32",
+        pa.int64(): "int64",
+        pa.uint8(): "uint8",
+        pa.uint16(): "uint16",
+        pa.uint32(): "uint32",
+        pa.uint64(): "uint64",
+        pa.float16(): "float16",
+        pa.float32(): "float32",
+        pa.float64(): "float64",
     }
 
     return mapping
@@ -332,10 +358,7 @@ def _arrow_cat_names_inf(cats: "pa.StringArray") -> Tuple[StringArray, Any]:
 
     off_len = len(cats) + 1
 
-    def get_n_bytes(typ: Type) -> int:
-        return off_len * (np.iinfo(typ).bits // 8)
-
-    if offset.size == get_n_bytes(np.int64):
+    if offset.size == off_len * 8:
         if not isinstance(cats, pa.LargeStringArray):
             arrow_str_error = "Expecting a `pyarrow.Array`."
             raise TypeError(arrow_str_error + f" Got: {type(cats)}.")
@@ -344,7 +367,7 @@ def _arrow_cat_names_inf(cats: "pa.StringArray") -> Tuple[StringArray, Any]:
         i32cats = cats.cast(pa.string())
         mask, offset, data = i32cats.buffers()
 
-    if offset.size != get_n_bytes(np.int32):
+    if offset.size != off_len * 4:
         raise TypeError(
             "Arrow dictionary type offsets is required to be 32-bit integer."
         )
@@ -408,8 +431,22 @@ def arrow_cat_inf(  # pylint: disable=too-many-locals
 
 def _ensure_np_dtype(
     data: DataType, dtype: Optional[NumpyDType]
-) -> Tuple[np.ndarray, Optional[NumpyDType]]:
-    """Ensure the np array has correct type and is contiguous."""
+) -> Tuple[Any, Optional[NumpyDType]]:
+    """Ensure the np array or MetalArray has correct type and is contiguous."""
+    if isinstance(data, MetalArray):
+        target_dt = dtype if dtype is not None else data.dtype
+        spec = resolve_dtype(target_dt)
+        if spec.name in ("float16", "bool"):
+            spec = resolve_dtype("float32")
+        if data.dtype != spec:
+            out = MetalArray.from_list(data.tolist(), dtype=spec)
+            return out, spec.name
+        return data.contiguous(), data.dtype.name
+    if not HAS_NUMPY or np is None:
+        arr = MetalArray.from_buffer(data, dtype=dtype)
+        if arr.dtype in ("float16", "bool"):
+            arr = MetalArray.from_list(arr.tolist(), dtype="float32")
+        return arr, arr.dtype.name
     if not data.dtype.isnative:
         data = data.astype(data.dtype.newbyteorder("="), copy=False)
         dtype = data.dtype
@@ -437,7 +474,7 @@ def array_interface_dict(data: np.ndarray) -> ArrayInf:
 
 def _check_arrow_string_offsets(last_offset: int) -> None:
     """Check that the final string offset fits in a 32-bit Arrow array."""
-    if last_offset > np.iinfo(np.int32).max:
+    if last_offset > 0x7FFFFFFF:
         raise ValueError(
             "The encoded categories exceed the maximum size of the 32-bit "
             "offsets used by Arrow string arrays."
