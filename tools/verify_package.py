@@ -37,6 +37,8 @@ def main():
                 assert wheel.read(relative) == expected_python[relative], relative
         actual_python = {name for name in wheel.namelist() if name.startswith("xgboost/") and not name.startswith("xgboost/lib/") and not name.endswith("/")}
         assert actual_python == expected_python.keys(), actual_python.symmetric_difference(expected_python)
+        for name in ("_xgboost_metal_dist.py", "xgboost_metal.pth"):
+            assert wheel.read(name) == (root / "python-package" / name).read_bytes(), name
         metadata = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
         assert (root / "README.md").read_bytes().strip() in wheel.read(metadata), "README metadata differs"
         for path in ("LICENSE", "NOTICE", "THIRD_PARTY.md", "third_party/nlohmann/LICENSE.MIT", "third_party/llvm/LICENSE.TXT"):
@@ -47,7 +49,8 @@ def main():
         "wheel_sha256": sha256(args.wheel.read_bytes()),
         "library_sha256": sha256(library), "native_source_sha256": native.hexdigest(),
         "native_payload_and_notices_byte_exact": True, "python_adapter_byte_exact": True,
-        "python_adapter_files": len(expected_python), "readme_embedded": True,
+        "python_adapter_files": len(expected_python), "metadata_finder_byte_exact": True,
+        "readme_embedded": True,
     }
     if args.sdist:
         workspace = subprocess.check_output(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=root)

@@ -4,28 +4,40 @@ xgboost-metal requires an Apple silicon Mac, macOS 14 or later, and
 Python 3.10 or later. Source builds require Xcode with the Metal compiler and
 a C++20 compiler. The build backend uses CMake 3.24 or later.
 
-## Install from source
+## Install from PyPI
 
 Create a dedicated environment. Upstream XGBoost and this distribution use the
 same Python import name and should be installed in separate environments.
 
 ```sh
-git clone https://github.com/tabulai/xgboost-metal.git
-cd xgboost-metal
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install .
+python -m pip install xgboost-metal
 ```
 
-NumPy and SciPy are installed as runtime dependencies. For scikit-learn
+The core package has no required Python dependencies. For scikit-learn
 estimators and pandas dataframes, install the optional extra:
 
 ```sh
-python -m pip install ".[sklearn]"
+python -m pip install "xgboost-metal[sklearn]"
 ```
 
 For Arrow input, also install `pyarrow`.
+
+The PyPI distribution is named `xgboost-metal`; its Python module is named
+`xgboost`, so use `import xgboost as xgb`. The package does not provide an
+`xgboost_metal` import.
+
+## Install from source
+
+With the environment activated:
+
+```sh
+git clone https://github.com/tabulai/xgboost-metal.git
+cd xgboost-metal
+python -m pip install .
+```
 
 ## Check the installation
 

@@ -1,9 +1,12 @@
 """Run from an isolated environment after installing the built wheel."""
 from pathlib import Path
 import ctypes
+import importlib.metadata
 import json
 import os
 import pickle
+import subprocess
+import sys
 import numpy as np
 import xgboost as xgb
 from category_fixture_check import check_category_fixtures
@@ -18,6 +21,14 @@ library = Path(xgb.build_info()['libxgboost']).resolve()
 assert 'site-packages/xgboost/lib/' in str(library), library
 assert library != root / 'lib/libxgboost.dylib'
 assert xgb.build_info()['USE_METAL'] is True
+
+# Metadata reports the upstream version, both after and before importing xgboost.
+upstream_version = xgb.__version__.replace('-dev', '.dev0')
+assert importlib.metadata.version('xgboost') == upstream_version
+fresh = subprocess.run([sys.executable, '-c', 'import importlib.metadata as m, sys; '
+                        'print(m.version("xgboost"), "xgboost" in sys.modules)'],
+                       capture_output=True, text=True, check=True).stdout.split()
+assert fresh == [upstream_version, 'False'], fresh
 
 check_category_fixtures()
 
@@ -501,7 +512,7 @@ for format in ['json', 'ubj']:
     assert roundtrip.attributes() == boundary_model.attributes()
     np.testing.assert_array_equal(roundtrip.predict(boundary_data), boundary_model.predict(boundary_data))
 print(json.dumps({'library': str(library), 'device': xgb.build_info()['METAL_DEVICE'],
-                  'checks': ['train', 'predict', 'pickle', 'UBJSON', 'contributions',
+                  'checks': ['upstream version metadata', 'train', 'predict', 'pickle', 'UBJSON', 'contributions',
                              'uniform and gradient-based row sampling, parallel trees and continuation',
                              'serial/SIMD split model equivalence',
                              'scalar and vector candidate tiles, exact models and unchanged command-buffer counts',

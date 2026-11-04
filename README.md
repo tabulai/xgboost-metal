@@ -6,6 +6,8 @@ metrics, and feature contributions on the Apple GPU.
 
 The package provides `DMatrix`, `QuantileDMatrix`, `train`, `cv`, and scikit-learn
 estimators through the `xgboost` import. The distribution name is `xgboost-metal`.
+Install it with `pip install xgboost-metal` and use `import xgboost as xgb` in
+Python; `xgboost_metal` is not a Python import name.
 
 ## Origin
 
@@ -40,19 +42,19 @@ Use a separate virtual environment because this distribution and upstream
 XGBoost provide the same `xgboost` package.
 
 ```sh
-git clone https://github.com/tabulai/xgboost-metal.git
-cd xgboost-metal
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install ".[sklearn]"
+python -m pip install "xgboost-metal[sklearn]"
 ```
 
 The `sklearn` extra installs the dependencies for the example below. Use
-`python -m pip install .` for the core Python API. See the
+`python -m pip install xgboost-metal` for the core Python API. See the
 [installation guide](docs/installation.md) for toolchain setup and wheel builds.
 
 ## Quick start
+
+Import `xgboost`, the same module name used by upstream XGBoost:
 
 ```python
 import xgboost as xgb
@@ -156,8 +158,8 @@ Compared with the previous `xgboost-metal` baseline (`6cdb29d`), GPU radix-sort 
 
 Report reproducible issues through
 [GitHub Issues](https://github.com/tabulai/xgboost-metal/issues). Include the
-macOS version, Apple chip, Python version, package version, and output of
-`xgboost.build_info()`.
+macOS version, Apple chip, Python version, xgboost-metal version
+(`python -m pip show xgboost-metal`), and output of `xgboost.build_info()`.
 
 ## License
 

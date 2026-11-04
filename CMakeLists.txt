@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
   set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING "Minimum macOS version")
 endif()
-project(xgboost_metal VERSION 3.5.0 LANGUAGES CXX OBJCXX)
+project(xgboost_metal VERSION 0.1.1 LANGUAGES CXX OBJCXX)
 
 if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
   message(FATAL_ERROR "xgboost-metal requires Apple silicon and Metal. There is no CPU backend.")
@@ -41,6 +41,11 @@ set_target_properties(xgboost PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/lib)
 install(TARGETS xgboost LIBRARY DESTINATION xgboost/lib)
 install(DIRECTORY include/ DESTINATION include)
+if(SKBUILD)
+  # Wheel only: report the xgboost distribution to importlib.metadata at startup.
+  install(FILES python-package/_xgboost_metal_dist.py python-package/xgboost_metal.pth
+          DESTINATION .)
+endif()
 
 option(METALGB_BUILD_TESTS "Build native GPU validation tests" OFF)
 if(METALGB_BUILD_TESTS)

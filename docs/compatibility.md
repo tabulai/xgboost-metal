@@ -2,8 +2,27 @@
 
 This package implements the XGBoost Python API on Apple Metal. The API baseline
 is XGBoost 3.5.0-dev at commit
-`6d2dbe19a099aa046178be8cfc303bfec1a623a6`. The package version is
-`3.5.0.dev0`; it does not imply compatibility with every upstream feature.
+`6d2dbe19a099aa046178be8cfc303bfec1a623a6`. Reporting that version does not
+imply compatibility with every upstream feature.
+
+## Version reporting
+
+Starting with release 0.1.1, the `xgboost` package reports the baseline version
+exactly as upstream XGBoost does at that commit, so version checks in other
+libraries behave as they would with upstream. The distribution keeps its own release number. (Release 0.1.0
+reported `0.1.0` from `xgboost.__version__`.)
+
+| Query | Result |
+| --- | --- |
+| `xgboost.__version__` | `3.5.0-dev` |
+| `importlib.metadata.version("xgboost")` | `3.5.0.dev0` |
+| `importlib.metadata.version("xgboost-metal")` | The xgboost-metal release |
+
+The wheel installs a startup hook, `xgboost_metal.pth`, that answers
+`importlib.metadata` lookups for `xgboost` by name, before or after
+`import xgboost`. pip does not see a separate `xgboost` distribution: `pip list`
+and `pip freeze` show only `xgboost-metal`, and installing a package that
+depends on `xgboost` still installs upstream XGBoost over this package's files.
 
 ## Supported workflows
 

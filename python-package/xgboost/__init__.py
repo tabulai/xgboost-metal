@@ -43,6 +43,14 @@ except ImportError:
 
 __version__ = _py_version()
 
+try:  # Some interpreters skip .pth files; see _xgboost_metal_dist.
+    from _xgboost_metal_dist import install as _install_metadata_finder
+except ImportError:  # pragma: no cover
+    pass
+else:
+    _install_metadata_finder()
+    del _install_metadata_finder
+
 
 __all__ = [
     # core

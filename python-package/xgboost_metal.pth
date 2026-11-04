@@ -1,0 +1,1 @@
+import _xgboost_metal_dist; _xgboost_metal_dist.install()
