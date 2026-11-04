@@ -82,7 +82,7 @@ execution target clear in shared application code.
 
 ## Benchmarks
 
-Measured on an **Apple M4 Max** (16 CPU cores, 128 GB unified memory, Release build without Metal validation layers), comparing `xgboost-metal` on the Apple GPU against regular OpenMP-enabled `xgboost 3.4.1` using all 16 CPU cores.
+The M4 results below were measured on an **Apple M4 Max** (16 CPU cores, 128 GB unified memory, Release build without Metal validation layers), comparing `xgboost-metal` on the Apple GPU against regular OpenMP-enabled `xgboost 3.4.1` using all 16 CPU cores. Separate M1 Ultra MNIST measurements follow the M4 MNIST table.
 
 ### MNIST 10-Class Classification (`60,000 × 784` Train → `10,000 × 784` Test)
 
@@ -102,6 +102,23 @@ Measured on an **Apple M4 Max** (16 CPU cores, 128 GB unified memory, Release bu
 | **Tuned `XGBClassifier`** (`300` rounds = `3,000` trees, `max_depth=5`, `subsample=0.66`, `colsample_bytree=0.53`) | Train (`fit`) | **`26.97 s`** | `76.04 s` | **2.82× faster** |
 | | Inference (`predict_proba`) | **`7.50 ms`** | `34.21 ms` | **4.56× faster** |
 | | Test Accuracy / Log-Loss | **`97.87%` / `0.0654`** | `97.75%` / `0.0705` | **`+0.12%`** (`99.44%` agreement) |
+
+### MNIST on Mac Studio M1 Ultra
+
+Measured on an **Apple M1 Ultra** Mac Studio (20 CPU cores, 128 GB unified memory, macOS 26.5.1) using the published `xgboost-metal 0.1.0` wheel and the OpenMP-enabled `xgboost 3.4.1` wheel with 20 CPU threads. Both use the same `XGBClassifier` settings: 100 rounds, `max_depth=6`, `learning_rate=0.3`, `tree_method="hist"`, and `random_state=42`. The `float64` input matches the type in the M4 default-classifier result; the `float32` row repeats the earlier M1 comparison.
+
+| Input | Metric | `xgboost-metal` (GPU) | `xgboost 3.4.1` (20-thread CPU) | Speedup / Delta |
+| --- | --- | ---: | ---: | --- |
+| `float64` `X/255` | Train (`fit`) | **9.38 s** | 24.03 s | **2.56× faster** |
+| | Inference (`predict`) | **6.70 ms** | 12.33 ms | **1.84× faster** |
+| | Inference (`predict_proba`) | **6.33 ms** | 12.31 ms | **1.94× faster** |
+| | Test accuracy / log-loss | **97.95% / 0.0642** | 97.84% / 0.0685 | **+0.11 percentage points** |
+| `float32` `X/255` | Train (`fit`) | **9.33 s** | 24.26 s | **2.60× faster** |
+| | Inference (`predict`) | **5.14 ms** | 12.18 ms | **2.37× faster** |
+| | Inference (`predict_proba`) | **4.91 ms** | 11.93 ms | **2.43× faster** |
+| | Test accuracy / log-loss | **97.95% / 0.0642** | 97.84% / 0.0685 | **+0.11 percentage points** |
+
+The M1 runs used the MNIST `train.csv.gz` and `test.csv.gz` files (60,000 training and 10,000 test images). Each backend was run in a separate process, alternating CPU and GPU; training times are medians of three fits and inference times are medians of 30 warmed calls per backend over the full test set. CSV loading is excluded from timings. Predictions agreed on 98.78% of test images for both input types. Other processes were active on the machine, so timings may vary with system load. The [MNIST benchmark script](benchmarks/mnist_classification.py) records individual timings, predictions, package versions, and input hashes.
 
 ### Core Training, Inference, Evaluation & Ingestion (`xgboost-metal` vs 16-Core CPU)
 
