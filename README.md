@@ -5,9 +5,8 @@ The native C++20 and Metal backend runs model training, prediction, evaluation
 metrics, and feature contributions on the Apple GPU.
 
 The package provides `DMatrix`, `QuantileDMatrix`, `train`, `cv`, and scikit-learn
-estimators through the `xgboost` import. The distribution name is `xgboost-metal`.
-Install it with `pip install xgboost-metal` and use `import xgboost as xgb` in
-Python; `xgboost_metal` is not a Python import name.
+estimators through the `xgboost` import. The distribution name is `xgboost-metal`,
+but use `import xgboost as xgb` in Python; `xgboost_metal` is not an import name.
 
 ## Origin
 
@@ -38,19 +37,23 @@ Metal is the execution backend. CPU and CUDA execution are not supported.
 
 ## Installation
 
-Use a separate virtual environment because this distribution and upstream
-XGBoost provide the same `xgboost` package.
+Releases are published as wheels on
+[GitHub](https://github.com/tabulai/xgboost-metal/releases). The wheel includes
+the compiled Metal kernels, so it does not need Xcode. Install it into a
+separate virtual environment, because this distribution and upstream XGBoost
+provide the same `xgboost` package:
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install "xgboost-metal[sklearn]"
+python -m pip install "xgboost-metal[sklearn] @ https://github.com/tabulai/xgboost-metal/releases/download/v0.1.1/xgboost_metal-0.1.1-py3-none-macosx_14_0_arm64.whl"
 ```
 
-The `sklearn` extra installs the dependencies for the example below. Use
-`python -m pip install xgboost-metal` for the core Python API. See the
-[installation guide](docs/installation.md) for toolchain setup and wheel builds.
+The `sklearn` extra installs the dependencies for the example below; remove
+`[sklearn]` to install only the core Python API. Installing from PyPI with
+`pip install xgboost-metal` is deprecated. See the
+[installation guide](docs/installation.md) for source builds and wheel builds.
 
 ## Quick start
 

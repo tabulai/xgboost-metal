@@ -69,6 +69,17 @@ operations using the installed library. `tools/verify_package.py` checks the
 package files and license notices; run it with `--help` for the required wheel,
 installed-library, and optional source-distribution paths.
 
+## Releases
+
+Releases are published as GitHub release assets, not on PyPI.
+
+1. Set the version in `pyproject.toml` and in the `project()` call in
+   `CMakeLists.txt`, and update the wheel URLs in `README.md` and
+   `docs/installation.md`. The wheel embeds the README, so do this first.
+2. Commit, build, and run the package checks above.
+3. Create a GitHub release tagged `vVERSION` at that commit, and attach the
+   wheel and source distribution from `dist/`.
+
 ## Pull requests
 
 Describe the behavior change and the relevant checks. Add regression coverage
