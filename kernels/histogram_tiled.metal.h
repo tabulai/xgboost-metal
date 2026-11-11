@@ -10,8 +10,10 @@
 // index = (g / chunk * rows + row) * chunk + g % chunk. A grouped task then
 // replaces up to four scattered 2-byte column gathers with one 4-byte load.
 // Code 255 marks a missing value only when histogram bins <= 255; with 256
-// bins it is an ordinary bin. Any code that cannot be represented sets
-// `invalid`, and the host keeps using the canonical uint16 storage instead.
+// bins it is an ordinary bin. Missing values then need `mask`: their byte is
+// zero and pack_histogram_missing flags them in a plane after the words.
+// Any code that cannot be represented sets `invalid`, and the host keeps
+// using the canonical uint16 storage instead.
 kernel void pack_histogram_bins(device const ushort* bins [[buffer(0)]],
                                 device uint* packed [[buffer(1)]],
                                 device atomic_uint* invalid [[buffer(2)]],
@@ -25,8 +27,8 @@ kernel void pack_histogram_bins(device const ushort* bins [[buffer(0)]],
     if (feature >= p.cols) break;
     uint code = load_bin(bins, ulong(feature) * p.rows + id.x, p.bins);
     if (code == 0xffffffffu) {
-      unrepresentable = unrepresentable || p.bins > 255;
-      code = 255;
+      unrepresentable = unrepresentable || (p.bins > 255 && !p.mask);
+      code = p.mask ? 0u : 255u;
     } else {
       unrepresentable = unrepresentable || code > 255 || (code == 255 && p.bins <= 255);
     }
@@ -34,6 +36,27 @@ kernel void pack_histogram_bins(device const ushort* bins [[buffer(0)]],
   }
   if (unrepresentable) atomic_store_explicit(invalid, 1, memory_order_relaxed);
   packed[(ulong(id.y / p.chunk) * p.rows + id.x) * p.chunk + id.y % p.chunk] = word;
+}
+
+// Missing-flag plane for 256 bins with missing values, where no byte code is
+// free. One ushort per row and chunk follows the packed words (two ushorts
+// each); bit 4 * (word group % chunk) + k flags feature k of a word group.
+// A chunk holds at most four word groups, so sixteen bits suffice.
+inline ulong packed_missing_plane(uint rows, uint cols, uint chunk) {
+  return ulong((((cols + 3) / 4 + chunk - 1) / chunk) * chunk) * rows * 2;
+}
+kernel void pack_histogram_missing(device const ushort* bins [[buffer(0)]],
+                                   device ushort* packed [[buffer(1)]],
+                                   constant PackBinsParams& p [[buffer(2)]],
+                                   uint2 id [[thread_position_in_grid]]) {
+  if (id.x >= p.rows) return;
+  uint flags = 0;
+  for (uint k = 0; k < 4 * p.chunk; ++k) {
+    uint feature = id.y * 4 * p.chunk + k;
+    if (feature >= p.cols) break;
+    if (load_bin(bins, ulong(feature) * p.rows + id.x, p.bins) == 0xffffffffu) flags |= 1u << k;
+  }
+  packed[packed_missing_plane(p.rows, p.cols, p.chunk) + ulong(id.y) * p.rows + id.x] = ushort(flags);
 }
 
 struct HistogramWork { uint begin, end, node, feature; bool single; };
@@ -89,6 +112,8 @@ struct HistogramSlice {
 };
 
 // Accumulate and publish one task, after its threadgroup scratch is cleared.
+// - Packed: 0 reads the uint16 bins, 1 the packed bytes (code 255 is missing
+//   below 256 bins), 2 the packed bytes plus the missing-flag plane.
 // - Missing: missing rows are summed privately and reduced per SIMD group.
 //   Otherwise (fully dense input) a missing code cannot occur; it would be
 //   added directly to the device missing bin, as the original dense kernels do.
@@ -99,7 +124,7 @@ struct HistogramSlice {
 // - A single owner stores every bin, zeros included, instead of adding into a
 //   cleared slice: 0 + total is the same modulo-2^64 value. Shared slices skip
 //   adding zero pairs, which leaves their sums unchanged.
-template <bool Packed, bool Missing, bool Present, bool Unit, bool CertI32, uint MaxFeatures>
+template <uint Packed, bool Missing, bool Present, bool Unit, bool CertI32, uint MaxFeatures>
 inline void histogram_tiled_body(device const ushort* bins, device const uint* row_ids,
                                  device const long2* gradients, device atomic_uint* hist,
                                  constant HistParams& p, HistogramSlice slice, long unit,
@@ -112,6 +137,12 @@ inline void histogram_tiled_body(device const ushort* bins, device const uint* r
   ulong packed_base = 0, packed_base_hi = 0;
   uint packed_stride = 1, packed_shift = 0;
   uint missing_code = p.bins <= 255 ? 255u : 256u;
+  // With a missing-flag plane (Packed == 2), flags replace the code comparison:
+  // 256 never matches a byte. An even chunk keeps both word groups of an
+  // eight-feature task in one ushort, where their flags are adjacent.
+  constexpr bool masked = Packed == 2;
+  ulong mask_base = 0, mask_base_hi = 0;
+  uint mask_shift = 0, mask_shift_hi = 0;
   if (Packed) {
     uint chunk = p.tasks >> kHistogramPackedShift;
     uint word_group = slice.feature >> 2;
@@ -122,6 +153,16 @@ inline void histogram_tiled_body(device const ushort* bins, device const uint* r
     }
     packed_stride = chunk;
     packed_shift = 8 * (slice.feature & 3);
+    if (masked) {
+      ulong plane = packed_missing_plane(p.rows, p.cols, chunk);
+      mask_base = plane + ulong(word_group / chunk) * p.rows;
+      mask_shift = 4 * (word_group % chunk) + (slice.feature & 3);
+      if (MaxFeatures == 8) {
+        uint hi_group = word_group + 1;
+        mask_base_hi = plane + ulong(hi_group / chunk) * p.rows;
+        mask_shift_hi = 4 * (hi_group % chunk);
+      }
+    }
   }
   auto words = reinterpret_cast<device const uint*>(bins);
   ulong2 missing[MaxFeatures];
@@ -129,6 +170,12 @@ inline void histogram_tiled_body(device const ushort* bins, device const uint* r
   for (uint i = slice.begin + tid; i < slice.end; i += 256) {
     uint row = row_ids[i];
     uint codes[MaxFeatures];
+    uint absent = 0;
+    if (masked) {
+      absent = uint(bins[mask_base + row]) >> mask_shift;
+      if (MaxFeatures == 8 && features > 4 && mask_base_hi != mask_base)
+        absent = (absent & 15u) | ((uint(bins[mask_base_hi + row]) >> mask_shift_hi) << 4);
+    }
     if (Packed) {
       if (MaxFeatures == 8) {
         uint2 pair;
@@ -140,17 +187,17 @@ inline void histogram_tiled_body(device const ushort* bins, device const uint* r
         }
         for (uint f = 0; f < 4; ++f) {
           uint code = (pair.x >> (8 * f)) & 255u;
-          codes[f] = code == missing_code ? 0xffffffffu : code;
+          codes[f] = code == missing_code || ((absent >> f) & 1u) ? 0xffffffffu : code;
         }
         for (uint f = 4; f < MaxFeatures; ++f) {
           uint code = (pair.y >> (8 * (f - 4))) & 255u;
-          codes[f] = code == missing_code ? 0xffffffffu : code;
+          codes[f] = code == missing_code || ((absent >> f) & 1u) ? 0xffffffffu : code;
         }
       } else {
         uint word = words[packed_base + ulong(row) * packed_stride] >> packed_shift;
         for (uint f = 0; f < MaxFeatures; ++f) {
           uint code = (word >> (8 * f)) & 255u;
-          codes[f] = code == missing_code ? 0xffffffffu : code;
+          codes[f] = code == missing_code || ((absent >> f) & 1u) ? 0xffffffffu : code;
         }
       }
     } else {
@@ -249,7 +296,7 @@ inline void histogram_tiled_body(device const ushort* bins, device const uint* r
 // is cleared before the device barrier that precedes any missing-bin atomic,
 // so missing sums still add into zero. Unit kernels select count-based
 // Hessians only when the tree's check found no mismatch.
-template <bool Packed, bool Missing, bool Present, bool Unit, uint LocalWords, uint MaxFeatures>
+template <uint Packed, bool Missing, bool Present, bool Unit, uint LocalWords, uint MaxFeatures>
 inline void histogram_tiled(device const ushort* bins, device const uint* row_ids,
                             device const long2* gradients, device const float2* scales,
                             device const HistTask* tasks,
@@ -352,6 +399,7 @@ inline void histogram_tiled(device const ushort* bins, device const uint* row_id
 
 // Scratch suffixes follow metal_histogram_compact_scratch: c1/c2 are the
 // compact one/two-feature sizes, w1/w4/w8 the single and grouped sizes.
+// The layout argument is histogram_tiled_body's Packed selector.
 #define HISTOGRAM_TILED_KERNEL(name, packed, missing, present, unit, words, features) \
   kernel void name(HISTOGRAM_TILED_ARGUMENTS) { \
     threadgroup atomic_uint local[words]; \
@@ -359,24 +407,30 @@ inline void histogram_tiled(device const ushort* bins, device const uint* row_id
         bins, row_ids, gradients, scales, tasks, hist, unit_mismatch, p, block, grid, tid, local); \
   }
 #define HISTOGRAM_TILED_SOURCES(name, missing, present, words, features) \
-  HISTOGRAM_TILED_KERNEL(name, false, missing, present, false, words, features) \
-  HISTOGRAM_TILED_KERNEL(name##_packed, true, missing, present, false, words, features) \
-  HISTOGRAM_TILED_KERNEL(name##_unit, false, missing, present, true, words, features) \
-  HISTOGRAM_TILED_KERNEL(name##_packed_unit, true, missing, present, true, words, features)
+  HISTOGRAM_TILED_KERNEL(name, 0, missing, present, false, words, features) \
+  HISTOGRAM_TILED_KERNEL(name##_packed, 1, missing, present, false, words, features) \
+  HISTOGRAM_TILED_KERNEL(name##_unit, 0, missing, present, true, words, features) \
+  HISTOGRAM_TILED_KERNEL(name##_packed_unit, 1, missing, present, true, words, features)
+// Missing-flag twins exist only where missing values can occur.
+#define HISTOGRAM_TILED_MASK_SOURCES(name, present, words, features) \
+  HISTOGRAM_TILED_SOURCES(name, true, present, words, features) \
+  HISTOGRAM_TILED_KERNEL(name##_packed_mask, 2, true, present, false, words, features) \
+  HISTOGRAM_TILED_KERNEL(name##_packed_mask_unit, 2, true, present, true, words, features)
 
 HISTOGRAM_TILED_SOURCES(histogram_tiled_dense_c1, false, false, 4 * 256, 1)
 HISTOGRAM_TILED_SOURCES(histogram_tiled_dense_c2, false, false, 4 * 512, 2)
 HISTOGRAM_TILED_SOURCES(histogram_tiled_dense_w1, false, false, 4 * 513, 1)
 HISTOGRAM_TILED_SOURCES(histogram_tiled_dense_w4, false, false, 4 * 1024, 4)
 HISTOGRAM_TILED_SOURCES(histogram_tiled_dense_w8, false, false, 4 * 1024, 8)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_missing_c1, true, false, 4 * 256, 1)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_missing_c2, true, false, 4 * 512, 2)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_missing_w1, true, false, 4 * 513, 1)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_missing_w4, true, false, 4 * 1024, 4)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_missing_w8, true, false, 4 * 1024, 8)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_present_w1, true, true, 4 * 513, 1)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_present_w4, true, true, 4 * 1024, 4)
-HISTOGRAM_TILED_SOURCES(histogram_tiled_present_w8, true, true, 4 * 1024, 8)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_missing_c1, false, 4 * 256, 1)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_missing_c2, false, 4 * 512, 2)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_missing_w1, false, 4 * 513, 1)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_missing_w4, false, 4 * 1024, 4)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_missing_w8, false, 4 * 1024, 8)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_present_w1, true, 4 * 513, 1)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_present_w4, true, 4 * 1024, 4)
+HISTOGRAM_TILED_MASK_SOURCES(histogram_tiled_present_w8, true, 4 * 1024, 8)
+#undef HISTOGRAM_TILED_MASK_SOURCES
 #undef HISTOGRAM_TILED_SOURCES
 #undef HISTOGRAM_TILED_KERNEL
 #undef HISTOGRAM_TILED_ARGUMENTS

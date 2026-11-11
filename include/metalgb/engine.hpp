@@ -146,7 +146,10 @@ struct Matrix : std::enable_shared_from_this<Matrix> {
   [[nodiscard]] Buffer partition_category_bounds() const;
   // Lazily derived uint8 histogram codes interleaved by feature group; empty
   // when a code does not fit. The canonical uint16 bins remain authoritative.
+  // With 256 bins and missing values no byte code is free, so the copy ends
+  // with a missing-flag plane (one ushort per row and chunk).
   [[nodiscard]] Buffer packed_bins(u32 chunk) const;
+  [[nodiscard]] bool packed_bins_masked() const { return histogram_bins == 256 && !quantized_dense; }
   void make_quantile_cuts(MatrixParams const& params);
   void export_cuts();
   [[nodiscard]] std::shared_ptr<Matrix> slice(std::span<int const> indices, bool allow_groups) const;

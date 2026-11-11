@@ -52,16 +52,114 @@ def wanted(packed=16, schedule=None, single=1, unit=1):
     [2, 33, 255, 256], [False, True], [1, 2, 3, 4], [4, 16])))
 def test_bin_codes_feature_groups_and_word_widths(bins, missing, group, width):
     # Seven features leave a partial word group and a partial 16-feature chunk.
-    # With 256 bins, dense code 255 is an ordinary bin; missing values then
-    # cannot be packed. Three features per group would straddle packed words.
+    # With 256 bins, dense code 255 is an ordinary bin; missing values are then
+    # flagged in a separate plane. Three features per group would straddle
+    # packed words.
     X, y = inputs(rows=1025, density=0.6)
     if not missing:
         X = np.nan_to_num(X)
-    packable = group != 3 and (bins <= 255 or not missing)
+    packable = group != 3
     _, stats = compare(X, y, bins=bins, rounds=2, expected=wanted(width if packable else 0),
                        options={"metal_histogram_packed_bins": width},
                        params={"metal_features_per_group": group, "max_depth": 6})
     assert all(item["tuning"]["features_per_group"] == group for item in stats)
+    masked = int(packable and missing and bins == 256)
+    assert all(item["tuning"]["histogram_packed_mask"] == masked for item in stats)
+
+
+def masked_inputs(rows, cols, seed=4242):
+    """At least 256 cuts per ordinary feature, with per-feature missing rates."""
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(rows, cols)).astype(np.float32)
+    y = (X[:, 0] - 0.5 * X[:, -1] + 0.25 * rng.normal(size=rows)).astype(np.float32)
+    rates = [0.2, 0.0, 0.5, 0.02, 1.0]
+    for column in range(cols):
+        X[rng.random(rows) < rates[column % len(rates)], column] = np.nan
+    if cols > 5:
+        # A few-bin feature beside full ones: its byte codes stay far below 255.
+        X[:, 5] = np.where(np.isnan(X[:, 5]), np.nan, np.round(X[:, 5]))
+    return X, y
+
+
+@pytest.mark.parametrize("cols", [1, 4, 5, 8, 9, 12, 13, 16, 17, 33])
+@pytest.mark.parametrize("group", [1, 2, 4, 8])
+@pytest.mark.parametrize("width", [4, 16])
+def test_missing_flag_plane_with_256_bins(cols, group, width):
+    # Word groups, chunks and eight-feature tasks end at every partial width.
+    # Width 4 gives each word group its own flags, so an eight-feature task
+    # reads two of them.
+    X, y = masked_inputs(1537, cols)
+    params = {"metal_features_per_group": group, "metal_histogram_rows": 256, "max_depth": 6}
+    actual, stats = compare(X, y, bins=256, rounds=2, expected=wanted(width), params=params,
+                            options={"metal_histogram_packed_bins": width})
+    assert all(item["tuning"]["histogram_packed_mask"] == 1 for item in stats)
+    # Same packed request without the plane: the uint16 bins, as before.
+    control, controls = fit(X, y, 1, bins=256, rounds=2,
+                            params={**params, "metal_histogram_packed_bins": width,
+                                    "metal_histogram_packed_mask": 0})
+    assert_identical(control, actual)
+    for item in controls:
+        assert item["tuning"]["histogram_packed_bins"] == 0
+        assert item["tuning"]["histogram_packed_mask"] == 0
+
+
+@pytest.mark.parametrize("case", ["present", "logistic", "weighted", "multiclass", "bytree", "sampling",
+                                  "quantile", "no_single_owner", "group_major"])
+def test_missing_flag_plane_kernel_variants(case):
+    X, y = masked_inputs(2053, 11)
+    params, metadata, options = {"metal_histogram_rows": 256, "max_depth": 6}, {}, {}
+    if case == "present":
+        params["metal_histogram_present"] = 1
+    elif case == "logistic":
+        y = (y > 0).astype(np.float32)
+        params["objective"] = "binary:logistic"
+    elif case == "weighted":
+        metadata["weight"] = np.linspace(0.5, 2, len(y), dtype=np.float32)
+    elif case == "multiclass":
+        y = np.digitize(y, np.quantile(y, [1 / 3, 2 / 3])).astype(np.float32)
+        params.update(objective="multi:softprob", num_class=3)
+    elif case == "bytree":
+        params.update(colsample_bytree=0.6, seed_per_iteration=True)
+    elif case == "sampling":
+        params["subsample"] = 0.7
+    elif case == "no_single_owner":
+        options["metal_histogram_single_owner"] = 0
+    elif case == "group_major":
+        options["metal_histogram_schedule"] = 1
+    unit = int(case in ("present", "bytree", "quantile", "no_single_owner", "group_major"))
+    expected = wanted(unit=unit, single=int(case != "no_single_owner"),
+                      schedule=1 if case == "group_major" else None)
+    _, stats = compare(X, y, bins=256, rounds=2, params=params, metadata=metadata, options=options,
+                       quantile=case == "quantile", expected=expected)
+    for item in stats:
+        assert item["tuning"]["gpu_tree"] == 1
+        assert item["tuning"]["histogram_packed_mask"] == 1
+        assert item["tuning"]["histogram_present"] == int(case == "present")
+
+
+@pytest.mark.parametrize("width", [4, 16])
+@pytest.mark.parametrize("cols", [8, 12, 21])
+def test_missing_flag_plane_with_certified_eight_feature_sums(width, cols):
+    # Dyadic gradients and unit Hessians certify 32-bit sums, so eight features
+    # with 256 bins fit one task's scratch instead of two four-feature halves.
+    X, y = masked_inputs(2053, cols)
+    gradient = np.resize(np.asarray([1, -1, 2, -0.5, 0, 4], np.float32), len(X))
+    hessian = np.ones(len(X), np.float32)
+    _, stats = compare(X, y, bins=256, rounds=3, options={"metal_histogram_packed_bins": width},
+                       expected=wanted(width),
+                       params={"metal_features_per_group": 8, "metal_histogram_rows": 256,
+                               "min_child_weight": 0, "max_depth": 6},
+                       custom=lambda prediction, matrix: (gradient, hessian))
+    for item in stats:
+        assert item["tuning"]["histogram_packed_mask"] == 1
+        assert item["tuning"]["histogram_i32"] == 1
+
+
+def test_missing_flag_plane_needs_256_bins_and_missing_values():
+    X, y = masked_inputs(1537, 9)
+    for values, bins in [(np.nan_to_num(X), 256), (X, 255), (X, 64)]:
+        _, stats = compare(values, y, bins=bins, rounds=1, expected=wanted())
+        assert all(item["tuning"]["histogram_packed_mask"] == 0 for item in stats)
 
 
 @pytest.mark.parametrize("missing", [False, True])
@@ -265,8 +363,9 @@ def test_requantization_and_width_changes_rebuild_packed_codes():
                        "metal_histogram_packed_bins": width if enabled else 0}
             model = xgb.Booster(options, [data])
             model.update(data, 0)
-            expected = width if enabled and bins <= 255 else 0
-            assert profile(model)["tuning"]["histogram_packed_bins"] == expected
+            tuning = profile(model)["tuning"]
+            assert tuning["histogram_packed_bins"] == (width if enabled else 0)
+            assert tuning["histogram_packed_mask"] == int(enabled and bins == 256)
             trace.append(snapshot(model, [data, xgb.DMatrix(X)]))
         traces.append(trace)
     for expected, actual in zip(*traces):

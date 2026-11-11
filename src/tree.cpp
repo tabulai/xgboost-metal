@@ -261,6 +261,7 @@ class TreeBuilder {
                             {"tree_control_fusion", 0}, {"fused_subtraction", 0}, {"fast_weight", 0}, {"fast_gain", 0},
                             {"histogram_present", 0}, {"histogram_compact_scratch", 0}, {"histogram_clear_built", 0},
                             {"histogram_schedule", 0}, {"histogram_single_owner", 0}, {"histogram_packed_bins", 0},
+                            {"histogram_packed_mask", 0},
                             {"histogram_unit_hessian", 0}, {"histogram_i32", 0},
                             {"split_threads", 32}, {"fast_stats", 0}, {"compact_splits", 0}, {"parallel_root", 0}, {"fused_score", 0},
                             {"fallback_parallel_root", 0}, {"fallback_parallel_splits", 0},
@@ -502,13 +503,17 @@ class TreeBuilder {
             "metal_histogram_packed_bins must be 0, 4 or 16.");
     bool tiled_histograms = !sparse_pipeline_ && (data_.quantized_dense || histogram_missing_);
     // A packed word holds four features, so a group must not straddle words.
-    // Code 255 marks missing values, which therefore need at most 255 bins.
+    // Code 255 marks missing values, which therefore need at most 255 bins;
+    // with 256 bins a missing-flag plane after the words marks them instead.
     // Narrow matrices interleave only the word groups they have.
+    bool packed_mask = data_.packed_bins_masked() &&
+                       learner_.integer("metal_histogram_packed_mask", 1) != 0;
     Buffer packed_bins;
     auto packed_chunk = std::max<u32>(1, std::min<u32>(packed_request / 4, div_up(data_.cols, 4)));
     if (tiled_histograms && packed_request && (4 % features_per_group_ == 0 || features_per_group_ == 8) &&
-        data_.histogram_bins <= (data_.quantized_dense ? 256u : 255u))
+        data_.histogram_bins <= (data_.quantized_dense || packed_mask ? 256u : 255u))
       packed_bins = data_.packed_bins(packed_chunk);
+    packed_mask = packed_mask && packed_bins;
     // Group-major records keep one feature column hot across a level's nodes;
     // tile-major records let the groups sharing a 16-byte packed chunk, row
     // IDs and gradients run back to back.
@@ -534,7 +539,7 @@ class TreeBuilder {
     if (tiled) {
       std::string width = features_per_group_ == 1 ? "_w1" : (features_per_group_ <= 4 ? "_w4" : "_w8");
       std::string scratch = histogram_compact_scratch ? (features_per_group_ == 1 ? "_c1" : "_c2") : width;
-      std::string source = packed_bins ? "_packed" : "";
+      std::string source = packed_bins ? (packed_mask ? "_packed_mask" : "_packed") : "";
       if (unit_hessian) source += "_unit";
       selected_histogram_kernel = std::string(data_.quantized_dense ? "histogram_tiled_dense" :
                                               "histogram_tiled_missing") + scratch + source;
@@ -962,6 +967,7 @@ class TreeBuilder {
     learner_.active_tuning["histogram_schedule"] = histogram_schedule;
     learner_.active_tuning["histogram_single_owner"] = single_owner;
     learner_.active_tuning["histogram_packed_bins"] = packed_bins ? packed_request : 0;
+    learner_.active_tuning["histogram_packed_mask"] = packed_mask;
     // Selection; synchronous rounds replace it with the GPU check's result.
     learner_.active_tuning["histogram_unit_hessian"] = unit_hessian;
     learner_.active_tuning["histogram_i32"] = tiled && cert_i32;
