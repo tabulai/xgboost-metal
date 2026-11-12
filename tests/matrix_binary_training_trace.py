@@ -93,8 +93,8 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     assert Path(xgb.__file__).resolve().is_relative_to(root / 'ref/xgboost')
-    library = Path(xgb.build_info()['libxgboost'])
-    assert hashlib.sha256(library.read_bytes()).hexdigest() == '061d0e5e88a7e7282d2eab9d0b4c53a12f73f2c83a999785b20c61e82c30bfc7'
+    from reference_identity import check_reference
+    check_reference(root, xgb)
     assert not args.output.exists()
     args.output.mkdir(parents=True)
     report = {}

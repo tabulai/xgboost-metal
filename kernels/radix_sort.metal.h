@@ -114,7 +114,9 @@ kernel void sampling_radix_init(device const Pair* gradients [[buffer(0)]],
       float sum = 0;
       for (uint target = 0; target < max(sp.padding, 1u); ++target) {
         auto pair = gradients[ulong(row) * sp.groups + sp.group + target];
-        sum += pair.g * pair.g + 0.1f * pair.h * pair.h;
+        // Match the CPU sampler: square before multiplying by lambda.
+        float grad_square = pair.g * pair.g, hess_square = pair.h * pair.h;
+        sum += grad_square + 0.1f * hess_square;
       }
       float value = sqrt(sum);
       magnitude[row] = value;

@@ -265,7 +265,8 @@ Array::Array(IngestColumnSpec const& spec) {
   pointer = spec.data_ptr;
   type = ingest_dtype_typestr(spec.dtype_code);
   width = ingest_dtype_width(spec.dtype_code);
-  if (spec.cols > 1) {
+  // Preserve zero-column tensors: collapsing them would invent values.
+  if (spec.cols != 1) {
     shape = {spec.rows, spec.cols};
     strides = {static_cast<std::ptrdiff_t>(spec.stride_r), static_cast<std::ptrdiff_t>(spec.stride_c)};
   } else {
