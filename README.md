@@ -87,6 +87,36 @@ execution target clear in shared application code.
 
 ## Benchmarks
 
+### M5 Ultra: Metal GPU vs stock CPU
+
+Measured November 12, 2026 on an **Apple M5 Ultra** (80-core GPU, 36 CPU cores, 512 GiB unified memory, macOS 27.2). The Metal library was built in Release mode on the M5 from commit `69a31a0`; the CPU uses the released OpenMP-enabled `xgboost 3.4.1` wheel with 36 threads. Metal validation was disabled. System load and GPU frequency were not independently monitored.
+
+The regression tests use identical generated inputs and labels, 100 rounds of `reg:squarederror`, 256 bins, `eta=0.3`, and seed 42. Training times exclude matrix construction and are medians of three fits in separate processes, with CPU and GPU order alternated. Predictions were bitwise identical between backends for each case; RMSE is measured on the training data.
+
+| Workload | Metal GPU | Stock CPU | CPU / GPU time | RMSE |
+| --- | ---: | ---: | ---: | ---: |
+| Dense `100,000 × 32`, depth 6 | 110.1 ms | 793.6 ms | **7.21×** | 0.1234 |
+| Dense `262,144 × 64`, depth 8 | 218.2 ms | 1,233.3 ms | **5.65×** | 0.1055 |
+| 15% missing, `100,000 × 32`, depth 6 | 112.9 ms | 808.6 ms | **7.16×** | 0.7558 |
+
+For MNIST (`float64`, 60,000 training and 10,000 test images, 100 depth-6 classifier rounds), median `fit` time was **3.88 s on Metal** and **15.15 s on CPU** (3.91×). Metal achieved 98.00% accuracy and 0.06466 log loss; CPU achieved 97.84% and 0.06845. Their predictions agreed on 98.96% of test images. The fit times include the classifier's internal matrix construction but exclude CSV loading.
+
+Median warmed `predict` time on the full MNIST test set was 3.22 ms on Metal and 5.73 ms on CPU, across 30 calls per backend. For `float32` input, median fit times were 3.88 s and 15.21 s, respectively, with the same accuracy and prediction agreement. Separately, the GPU streaming-copy benchmark measured 535 GB/s median read-plus-write bandwidth for 256 MiB; this is a workload measurement, not a peak-bandwidth claim.
+
+### MNIST across Apple silicon machines
+
+The table compares the same stated `XGBClassifier` settings (`float64` pixels divided by 255, 100 rounds, depth 6, learning rate 0.3, `tree_method="hist"`, and seed 42). CPU measurements use stock OpenMP-enabled XGBoost 3.4.1. Fit times exclude CSV loading.
+
+| Machine | Metal GPU fit | Stock CPU fit | CPU / GPU time | GPU accuracy | CPU accuracy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| M5 Ultra, 36 CPU threads | 3.88 s | 15.15 s | 3.91× | 98.00% | 97.84% |
+| M4 Max, 16 CPU threads | 9.47 s | 37.75 s | 3.99× | 98.00% | 97.84% |
+| M1 Ultra, 20 CPU threads | 9.38 s | 24.03 s | 2.56× | 97.95% | 97.84% |
+
+These measurements are **indicative rather than a controlled hardware-only comparison**. Metal builds, operating systems, dates, and machine activity differ. The M1 used the `xgboost-metal 0.1.0` wheel; the M5 used the newer source build. The M5 data was converted from standard MNIST IDX files; hashes of the older MNIST CSV files have not been verified against it. Other processes were active during the M1 measurements. Each M5 backend used three separate, alternating process trials. The [MNIST benchmark script](benchmarks/mnist_classification.py) records timings, quality, package versions, and input hashes.
+
+### M4 Max benchmark details
+
 The M4 results below were measured on an **Apple M4 Max** (16 CPU cores, 128 GB unified memory, Release build without Metal validation layers), comparing `xgboost-metal` on the Apple GPU against regular OpenMP-enabled `xgboost 3.4.1` using all 16 CPU cores. Separate M1 Ultra MNIST measurements follow the M4 MNIST table.
 
 ### MNIST 10-Class Classification (`60,000 × 784` Train → `10,000 × 784` Test)
