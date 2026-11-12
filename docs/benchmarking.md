@@ -547,15 +547,41 @@ loads one 4-byte word per row instead of four scattered 2-byte column gathers.
 At deep levels, a node's rows are a sparse subset of all rows, so this greatly
 reduces the memory sectors fetched. The copy is built once per quantization
 and chunk width, and the canonical uint16 bins remain authoritative. It needs
-one, two or four features per group and every code within 8 bits: at most
-256 bins for dense input, or 255 with code 255 marking missing values. Other
-inputs, including 256-bin data with missing values, keep the uint16 bins. The
-copy adds one byte per row and padded feature. With packing enabled, dense
+one, two, four or eight features per group and every bin code within 8 bits,
+so at most 256 bins; larger bin counts keep the uint16 bins. Below 256 bins,
+code 255 marks a missing value. The copy adds one byte per row and padded
+feature. With packing enabled, dense
 numeric scalar inputs with at least 16384 rows also default to four features
 per histogram group, like the existing large-data grouping. This default also
 applies to host-driven depthwise trees, where it measured neutral to slightly
 faster, but not to lossguide trees, whose small per-leaf histograms ran slower
 grouped; `metal_features_per_group` remains an explicit override.
+
+With 256 bins and missing values, which the default `max_bin` gives any
+continuous feature, no byte code is free. `metal_histogram_packed_mask=1`
+(the default) then appends a missing-flag plane to the packed copy: one 16-bit
+word per row and chunk, with one flag per feature. A missing value's byte is
+zero, and `_packed_mask` twins of the missing-value kernels test the flag
+instead of comparing codes. Present values keep their codes, so every row
+still adds the same integers to the same bins. The plane adds two bytes per
+row and chunk. Kernels for dense input and for fewer than 256 bins are
+unchanged. Set the option to zero to keep the uint16 bins for such input;
+`histogram_packed_mask` reports selection. Default feature grouping is
+unchanged: missing-valued input keeps two features per group below 262144
+rows or 32 columns, where one packed word serves only two features.
+
+On the local M4 Max, fresh processes alternated the previous build with this
+one for three cycles of three 100-round `xgb.train` fits at 256 bins
+(`binary:logistic`, depth six unless noted). Medians in milliseconds per tree,
+previous to current: 500,000 x 64 with 15% missing values 3.79 to 2.86
+(1.33x), the same data with squared error 3.60 to 2.69 (1.34x), 262,144 x 64
+at depth eight 3.97 to 3.38 (1.17x), and 1,000,000 x 64 with 0.1% missing
+values 7.13 to 4.63 (1.54x). Two shapes that keep two features per group
+moved little: 100,000 x 32 went from 1.10 to 1.09 and 60,000 x 256 with 30%
+missing values from 2.80 to 2.69. Explicit `metal_histogram_packed_mask=0`
+reproduced the previous timings, and dense and 255-bin controls matched the
+previous build, all within 1.5%. Saved models were byte-identical in every
+arm. These are fixed synthetic workloads on one machine.
 
 `metal_histogram_schedule` replaces `plan_histograms`' per-group task records
 with one record per row tile. Each threadgroup derives its feature group from

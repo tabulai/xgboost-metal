@@ -38,7 +38,7 @@ struct ShapLeaf { u32 begin, count, group, round; float value, expectation; u32 
 struct MatrixParams { u32 rows, cols, stride, bins, numeric_bins; };
 struct CategoryRecodeParams { u32 rows, cols, construction, column_major; };
 struct QuantileValueParams { u32 rows, cols, bins, representative, numeric_only; };
-struct PackBinsParams { u32 rows, cols, bins, chunk; };
+struct PackBinsParams { u32 rows, cols, bins, chunk, mask; };
 struct NormalizeParams { u32 rows, cols; float missing; u32 block_stride; };
 struct SortParams { u32 rows, cols, stride, width; };
 struct SketchStats { u32 nonmissing, elements, runs, summary; };

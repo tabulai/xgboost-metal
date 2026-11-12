@@ -1407,11 +1407,17 @@ Buffer Matrix::packed_bins(u32 chunk) const {
     // Built once per quantization and chunk width. An unrepresentable code
     // is also remembered, so later trees do not repeat the conversion.
     auto groups = div_up(div_up(cols, 4), chunk) * chunk;
-    Buffer packed(checked_product(checked_product(groups, rows), sizeof(u32)));
+    bool mask = packed_bins_masked();
+    auto code_bytes = checked_product(checked_product(groups, rows), sizeof(u32));
+    auto mask_bytes = mask ? div_up(checked_product(checked_product(groups / chunk, rows), sizeof(std::uint16_t)),
+                                    sizeof(u32)) * sizeof(u32) : 0;
+    Buffer packed(code_bytes + mask_bytes);
     Buffer invalid(sizeof(u32)); invalid.zero();
-    PackBinsParams p{rows, cols, histogram_bins, chunk};
+    PackBinsParams p{rows, cols, histogram_bins, chunk, mask};
     Command command("pack histogram bins");
     command.dispatch("pack_histogram_bins", {bins, packed, invalid}, p, {div_up(rows, 256), groups, 1});
+    if (mask)
+      command.dispatch("pack_histogram_missing", {bins, packed}, p, {div_up(rows, 256), groups / chunk, 1});
     command.wait();
     packed_bins_ = invalid.as<u32>()[0] ? Buffer{} : std::move(packed);
     packed_chunk_ = chunk;
