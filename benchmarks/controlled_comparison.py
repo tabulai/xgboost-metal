@@ -151,6 +151,7 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--cpu-python is required for CPU runs")
     if any(r["backend"] == "metal" for r in schedule) and not args.metal_python:
         raise ValueError("--metal-python is required for Metal runs")
+    uses_metal = any(r["backend"] == "metal" for r in schedule)
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "runs").mkdir()
     manifest = {"created_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -159,8 +160,8 @@ def run(args: argparse.Namespace) -> None:
                 "logical_cpus": os.cpu_count(),
                 "runner_checkout_commit": command_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"]),
                 "runner_checkout_dirty": command_output(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"]),
-                "metal_checkout_commit": command_output(["git", "-C", str(args.metal_pythonpath.resolve().parent), "rev-parse", "HEAD"]),
-                "metal_checkout_dirty": command_output(["git", "-C", str(args.metal_pythonpath.resolve().parent), "status", "--porcelain", "--untracked-files=no"]),
+                "metal_checkout_commit": command_output(["git", "-C", str(args.metal_pythonpath.resolve().parent), "rev-parse", "HEAD"]) if uses_metal else None,
+                "metal_checkout_dirty": command_output(["git", "-C", str(args.metal_pythonpath.resolve().parent), "status", "--porcelain", "--untracked-files=no"]) if uses_metal else None,
                 "worker_sha256": file_hash(Path(__file__).resolve()),
                 "numpy_version_required": args.numpy_version, "cpu_version_required": args.cpu_version,
                 "openmp_sha256": file_hash(args.omp_library) if args.omp_library else None,
