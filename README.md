@@ -107,6 +107,8 @@ Each synthetic `reg:squarederror` workload uses 100 rounds, 256 bins, `eta=0.3`,
 
 These runs control the source, inputs, and model settings, but are not a pure hardware-only comparison: CPU thread counts, operating systems, and compilers differ. Metal validation was disabled; power, clocks, and background activity were not independently controlled. Three fits per setting do not establish confidence intervals. The M5 figures are from a repeat run, so they differ slightly from the earlier M5-only measurements. Training RMSE for the three workloads was 0.1234, 0.1055, and 0.7558, respectively.
 
+The [benchmark runner and reproduction instructions](docs/benchmarking.md#three-machine-regression-and-thread-sweeps) and [original per-fit results](benchmarks/results/2026-11-12/) are included in the repository.
+
 ### Thread settings on M5 Ultra
 
 Stock CPU XGBoost scaled poorly beyond 8–12 threads on these workloads. In a separate thread sweep, the fastest tested CPU settings were **4 threads** for the smaller dense case (253.7 ms), **12 threads** for the larger dense case (825.1 ms), and **8 threads** for the missing-value case (327.1 ms). Compared with the GPU medians in the table, those exploratory CPU / GPU ratios are approximately **2.36×, 3.70×, and 2.94×**. The 36-thread CPU figures above are therefore not tuned CPU baselines. These settings were selected on the same workloads and are starting points for measurement, not universal defaults.

@@ -56,6 +56,105 @@ Alternate backend order across independent processes and retain every repeat,
 including slow runs. A short warmup compiles pipelines; it does not guarantee a
 fixed GPU frequency.
 
+### Three-machine regression and thread sweeps
+
+The [controlled comparison runner](../benchmarks/controlled_comparison.py)
+recreates the three synthetic regression workloads in the README, plus the
+CPU thread and Metal split-thread/histogram grouping sweeps. The original
+November 12, 2026 per-fit receipts and machine manifests are in
+[`benchmarks/results/2026-11-12/`](../benchmarks/results/2026-11-12/). They
+retain all timings, parameters, hashes, and GPU profiles used for those tables;
+generated prediction arrays, machine-specific paths, and process logs are not
+included. The portable runner was written after those measurements and follows
+the same workloads and timing boundaries, but its process ordering and receipt
+format are not an exact replay of the original scripts.
+
+Audit the committed receipts and recompute the comparison table with:
+
+```sh
+python3 benchmarks/verify_controlled_results.py
+```
+
+To reproduce the historical source build, use an Apple silicon Mac with the
+Metal toolchain, CMake, and Python 3.13.11. From the current repository, create
+a separate checkout at the tested commit, so the runner remains available here:
+
+```sh
+mkdir -p .bootstrap
+git worktree add --detach .bootstrap/controlled-source 69a31a0
+python3.13 -m venv .bootstrap/bench-cpu
+python3.13 -m venv .bootstrap/bench-metal
+.bootstrap/bench-cpu/bin/python -m pip install numpy==2.5.4 scipy==1.18.1 xgboost==3.4.1
+.bootstrap/bench-metal/bin/python -m pip install numpy==2.5.4 scipy==1.18.1
+cmake -S .bootstrap/controlled-source -B .bootstrap/controlled-build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DPython3_EXECUTABLE="$PWD/.bootstrap/bench-metal/bin/python"
+cmake --build .bootstrap/controlled-build
+```
+
+The CPU wheel must report `USE_OPENMP: true`. Install an OpenMP runtime if
+needed and provide its dylib using `--omp-library`; its hash is recorded. The
+original three machines used the same XGBoost 3.4.1 wheel and the same OpenMP
+runtime binary. Different runtime or compiler versions can change the result;
+compare the recorded library hashes rather than assuming package versions are
+sufficient. The original Metal builds were compiled independently on each
+machine and have different hashes. Record power mode and background load, and
+run without Metal validation.
+
+For example, with a Homebrew OpenMP installation, run on each machine with
+its own CPU core count (36 on the original M5, 16 on the M4, 20 on the M1):
+
+```sh
+CPU_PY="$PWD/.bootstrap/bench-cpu/bin/python"
+METAL_PY="$PWD/.bootstrap/bench-metal/bin/python"
+METAL_PKG="$PWD/.bootstrap/controlled-source/python-package"
+OMP_LIB="$(brew --prefix libomp)/lib/libomp.dylib"
+
+python3 benchmarks/controlled_comparison.py run --mode compare \
+  --cpu-python "$CPU_PY" --metal-python "$METAL_PY" \
+  --metal-pythonpath "$METAL_PKG" --omp-library "$OMP_LIB" \
+  --threads 36 --cycles 3 --output benchmark-results/controlled-m5
+```
+
+Replace `--threads 36` with the machine's count and use a fresh output
+directory for each run. The runner checks the imported backend, the CPU wheel
+version and OpenMP support, and NumPy's version. Optional `--cpu-sha` and
+`--metal-sha` pin exact native libraries; the recorded wheel and runtime hashes
+are in the committed machine manifests. Each child records the native hash,
+build details, model and prediction hashes, data hashes, training and process
+CPU times, and the Metal profile when applicable. The summary flags differing
+input, label, prediction, or Metal model hashes and the runner exits nonzero.
+Compare per-case hashes across machines as well; a successful run only checks
+the cases within that run.
+
+To reproduce the M5 tuning grids, use separate fresh output directories:
+
+```sh
+python3 benchmarks/controlled_comparison.py run --mode cpu-sweep \
+  --cpu-python "$CPU_PY" --omp-library "$OMP_LIB" \
+  --thread-grid 1 4 8 12 16 20 24 28 32 36 --cycles 3 \
+  --output benchmark-results/cpu-sweep-m5
+
+python3 benchmarks/controlled_comparison.py run --mode gpu-threads \
+  --metal-python "$METAL_PY" --metal-pythonpath "$METAL_PKG" \
+  --cycles 5 --output benchmark-results/gpu-threads-m5
+
+python3 benchmarks/controlled_comparison.py run --mode gpu-hist \
+  --metal-python "$METAL_PY" --metal-pythonpath "$METAL_PKG" \
+  --cycles 5 --output benchmark-results/gpu-hist-m5
+```
+
+`gpu-threads` crosses CPU-side `nthread` values 1, 4, 8, 12, 16, and 36 with
+32/256 requested split threads. `gpu-hist` crosses 1,024/2,048/4,096 rows per
+tile with 1/2/4 features per group. Check the recorded profile: compact split
+kernels can select 256 threads even when 32 are requested. Both GPU sweeps use
+a 16,384-row warmup instead of the comparison's 1,024-row warmup, so their
+absolute timings should not be compared directly. For the original M4 CPU
+thread grid, use `1 4 8 12 16 20 24 36`. The M5 wait-policy experiment can be
+repeated with `--mode cpu-sweep --thread-grid 36 --wait-policy passive`, but
+the original receipts alternated default and passive policies within cycles;
+running the two policies separately does not reproduce that ordering.
+
 `benchmarks/deep_trees.py` compares pinned native builds on dense and
 missing-valued data at depths 6, 8, and 10, using both tree drivers. Supply a
 JSON arm file with two entries, for example:
