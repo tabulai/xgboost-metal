@@ -87,17 +87,35 @@ execution target clear in shared application code.
 
 ## Benchmarks
 
-### M5 Ultra: Metal GPU vs stock CPU
+### Controlled regression: Metal GPU vs stock CPU
 
-Measured November 12, 2026 on an **Apple M5 Ultra** (80-core GPU, 36 CPU cores, 512 GiB unified memory, macOS 27.2). The Metal library was built in Release mode on the M5 from commit `69a31a0`; the CPU uses the released OpenMP-enabled `xgboost 3.4.1` wheel with 36 threads. Metal validation was disabled. System load and GPU frequency were not independently monitored.
+Measured November 12, 2026 on an **M5 Ultra** (80-core GPU, 36 CPU cores, 512 GiB), **M4 Max** (16 CPU cores, 128 GiB), and **M1 Ultra** (20 CPU cores, 128 GiB). The Metal libraries were built in Release mode on each machine from commit `69a31a0`; CPU runs used the same OpenMP-enabled `xgboost 3.4.1` wheel and OpenMP runtime. All used Python 3.13.11 and NumPy 2.5.4. CPU thread counts used the available cores: 36, 16, and 20, respectively.
 
-The regression tests use identical generated inputs and labels, 100 rounds of `reg:squarederror`, 256 bins, `eta=0.3`, and seed 42. Training times exclude matrix construction and are medians of three fits in separate processes, with CPU and GPU order alternated. Predictions were bitwise identical between backends for each case; RMSE is measured on the training data.
+Each synthetic `reg:squarederror` workload uses 100 rounds, 256 bins, `eta=0.3`, and seed 42. Inputs use NumPy's generator with seed 1337; the missing-value case replaces 15% of feature values with NaN. Times are medians of three fits in separate processes with CPU and GPU order alternated; matrix construction and prediction are excluded. **Inputs, labels, and predictions were bitwise identical across all three machines and both backends** within each workload. The final column is the ratio of median CPU time to median GPU time.
 
-| Workload | Metal GPU | Stock CPU | CPU / GPU time | RMSE |
-| --- | ---: | ---: | ---: | ---: |
-| Dense `100,000 × 32`, depth 6 | 110.1 ms | 793.6 ms | **7.21×** | 0.1234 |
-| Dense `262,144 × 64`, depth 8 | 218.2 ms | 1,233.3 ms | **5.65×** | 0.1055 |
-| 15% missing, `100,000 × 32`, depth 6 | 112.9 ms | 808.6 ms | **7.16×** | 0.7558 |
+| Workload | Machine | Metal GPU | Stock CPU | CPU / GPU time |
+| --- | --- | ---: | ---: | ---: |
+| Dense `100,000 × 32`, depth 6 | M5 Ultra | 107.4 ms | 785.5 ms | 7.32× |
+| | M4 Max | 121.2 ms | 293.0 ms | 2.42× |
+| | M1 Ultra | 276.4 ms | 784.6 ms | 2.84× |
+| Dense `262,144 × 64`, depth 8 | M5 Ultra | 222.8 ms | 1,227.8 ms | 5.51× |
+| | M4 Max | 332.0 ms | 949.8 ms | 2.86× |
+| | M1 Ultra | 666.0 ms | 2,440.6 ms | 3.66× |
+| 15% missing, `100,000 × 32`, depth 6 | M5 Ultra | 111.2 ms | 804.6 ms | 7.24× |
+| | M4 Max | 127.0 ms | 356.9 ms | 2.81× |
+| | M1 Ultra | 266.9 ms | 973.9 ms | 3.65× |
+
+These runs control the source, inputs, and model settings, but are not a pure hardware-only comparison: CPU thread counts, operating systems, and compilers differ. Metal validation was disabled; power, clocks, and background activity were not independently controlled. Three fits per setting do not establish confidence intervals. The M5 figures are from a repeat run, so they differ slightly from the earlier M5-only measurements. Training RMSE for the three workloads was 0.1234, 0.1055, and 0.7558, respectively.
+
+### Thread settings on M5 Ultra
+
+Stock CPU XGBoost scaled poorly beyond 8–12 threads on these workloads. In a separate thread sweep, the fastest tested CPU settings were **4 threads** for the smaller dense case (253.7 ms), **12 threads** for the larger dense case (825.1 ms), and **8 threads** for the missing-value case (327.1 ms). Compared with the GPU medians in the table, those exploratory CPU / GPU ratios are approximately **2.36×, 3.70×, and 2.94×**. The 36-thread CPU figures above are therefore not tuned CPU baselines. These settings were selected on the same workloads and are starting points for measurement, not universal defaults.
+
+For the Metal GPU, the existing default `metal_split_threads=256` is supported by the measurements. On the smaller dense case, 256 split threads took 99.3 ms versus 151.1 ms with 32 threads, at `nthread=1`. The other two workloads selected the 256-thread compact kernel even when 32 were requested. CPU-side `nthread` values from 1 to 36 did not yield a consistently faster GPU fit; `nthread=1` is a reasonable setting to test when limiting CPU-side parallelism. Five fits per configuration were measured in a separate sweep with a different warmup, so its absolute times should not be directly compared with the three-machine table. Across 315 thread and histogram grouping fits, models and predictions remained identical within each workload. No GPU defaults were changed; the histogram grouping measurements did not establish a reliable improvement over them.
+
+### M5 Ultra: MNIST and bandwidth
+
+The M5 MNIST comparison used the same 36-thread stock CPU release and the Metal build described above, on macOS 27.2. System load and GPU frequency were not independently monitored.
 
 For MNIST (`float64`, 60,000 training and 10,000 test images, 100 depth-6 classifier rounds), median `fit` time was **3.88 s on Metal** and **15.15 s on CPU** (3.91×). Metal achieved 98.00% accuracy and 0.06466 log loss; CPU achieved 97.84% and 0.06845. Their predictions agreed on 98.96% of test images. The fit times include the classifier's internal matrix construction but exclude CSV loading.
 
